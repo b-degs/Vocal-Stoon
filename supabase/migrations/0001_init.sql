@@ -234,9 +234,10 @@ alter table poll_ballots enable row level security;
 -- vote on a budget item is public record in real municipal government,
 -- not a secret ballot; the whole point of this table is letting residents
 -- see whether council's actual decision matched what they voted for.
--- One row per (poll, council member) — casting again just updates it,
--- rather than being a one-shot roll-call vote, since this is still a
--- pilot and council may want to revise before residents see it.
+-- One row per (poll, council member) — a one-shot roll-call vote, like a
+-- real council record: once cast, it can't be changed (see cast_council_vote
+-- below, which rejects a second attempt the same way cast_vote() rejects a
+-- resident double-voting).
 -- ---------------------------------------------------------------------
 create table if not exists council_votes (
   poll_id uuid not null references polls(id) on delete cascade,
@@ -246,16 +247,18 @@ create table if not exists council_votes (
   primary key (poll_id, resident_id)
 );
 alter table council_votes enable row level security;
--- No direct policies: only cast_council_vote() (insert/update) and
--- poll_results() (folded into its existing payload, see below) touch
--- this — same "no direct API access, only through a function" pattern as
--- every other table here.
+-- No direct policies: only cast_council_vote() (insert) and poll_results()
+-- (folded into its existing payload, see below) touch this — same "no
+-- direct API access, only through a function" pattern as every other
+-- table here.
 
--- Council casts (or updates) their own vote on an item. Any council
--- member can vote regardless of the poll's open/closed status — this
--- doesn't force a particular process (residents vote, then council
--- decides, in whatever order actually happens) — but only a council
--- session can call it, and only for one of the poll's real options.
+-- Council casts their own vote on an item, once. Any council member can
+-- vote regardless of the poll's open/closed status — this doesn't force a
+-- particular process (residents vote, then council decides, in whatever
+-- order actually happens) — but only a council session can call it, only
+-- for one of the poll's real options, and only once: the (poll_id,
+-- resident_id) primary key is the real, database-enforced guard, same
+-- mechanism cast_vote() uses to block a resident double-voting.
 create or replace function cast_council_vote(p_session_token uuid, p_poll_id uuid, p_option_id text) returns void
 language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
@@ -271,9 +274,11 @@ begin
     raise exception 'Not a valid option for this vote.' using errcode = '22023';
   end if;
 
-  insert into council_votes (poll_id, resident_id, option_id)
-  values (p_poll_id, v_caller.id, p_option_id)
-  on conflict (poll_id, resident_id) do update set option_id = excluded.option_id, voted_at = now();
+  begin
+    insert into council_votes (poll_id, resident_id, option_id) values (p_poll_id, v_caller.id, p_option_id);
+  exception when unique_violation then
+    raise exception 'You already cast your council vote on this item.' using errcode = '23505';
+  end;
 end;
 $$;
 grant execute on function cast_council_vote(uuid,uuid,text) to anon, authenticated;

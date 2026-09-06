@@ -497,7 +497,11 @@
         }).forEach(function(p){ toast('New vote opened: ' + p.title); });
       }
       haveSeenFirstSnapshot = true;
-      refreshMyBallots().then(function(){ refreshNotifications(); render(); });
+      refreshMyBallots().then(function(){
+        refreshNotifications();
+        refreshCouncilTransparency(false);
+        render();
+      });
     }
     refetchPolls = function(){
       return sb.from('polls').select('*').then(function(res){
@@ -570,9 +574,30 @@
     return sb.rpc('poll_results', withToken({ p_poll_id: pollId })).then(function(res){
       if(res.error){ toast('Could not load results: ' + rpcErrorMessage(res.error, 'please try again.')); return; }
       var r = res.data || {};
-      S.pollResults[pollId] = { counts: r.counts || {}, total: r.total || 0, eligible: r.eligible || 0 };
+      S.pollResults[pollId] = {
+        counts: r.counts || {}, total: r.total || 0, eligible: r.eligible || 0,
+        councilCounts: r.councilCounts || {}, councilVotes: r.councilVotes || []
+      };
       render();
     }).catch(function(e){ toast('Could not load results: ' + rpcErrorMessage(e, 'please try again.')); });
+  }
+
+  // Keeps renderCouncilVoteSummary() (shown in History, open or closed —
+  // see that function) fed with current data. There's no live push for
+  // this: Realtime is only wired up to `polls` itself (see SPEC.md
+  // "Realtime"), not to council_votes/poll_ballots, so a resident sitting
+  // on an already-open History tab won't see a council vote the instant
+  // it's cast — only on the moments this gets called: right after this
+  // resident's own poll list refreshes, right after they cast their own
+  // vote, and every time they open the History tab (force=true there, so
+  // it never goes stale just because it was already fetched once).
+  // Skipped entirely for a council session — council already has its own
+  // "View/Refresh results" buttons in Manage Votes.
+  function refreshCouncilTransparency(force){
+    if(!S.currentUser || S.currentUser.role === 'council') return;
+    S.polls.filter(function(p){
+      return (S.myBallots[p.id] || p.status === 'closed') && pollVisibleToResident(p, S.currentUser) && (force || !S.pollResults[p.id]);
+    }).forEach(function(p){ computeResults(p.id); });
   }
 
   /* ---------------------------------------------------------------------
@@ -760,6 +785,7 @@
       S.myBallots[pollId] = { optionId: optionId };
       S.view = 'resident'; S.activePollId = null; S.selectedOptionId = null;
       toast('Your vote has been recorded.');
+      computeResults(pollId);
       render();
     }).catch(function(e){
       S.voteBusy = false;
@@ -1185,28 +1211,39 @@
     var p = S.polls.filter(function(x){ return x.id === S.activePollId; })[0];
     if(!p) return '<div class="empty">This vote is no longer available.</div><button class="btn btn-ghost" data-back="council">Back</button>';
     var res = S.pollResults[p.id];
+    // A council vote is a one-shot roll call (see cast_council_vote() in
+    // 0001_init.sql) — once cast it can't be changed, so if this council
+    // member already has a vote on record, show it locked instead of an
+    // editable picker.
     var existing = res && res.councilVotes ? res.councilVotes.filter(function(v){ return v.residentId === S.currentUser.id; })[0] : null;
-    return '' +
-    '<div class="card pad-lg" style="max-width:640px;">' +
-      '<div class="poll-meta" style="margin-bottom:6px;"><span class="chip chip-neutral"><span class="chip-dot"></span>' + esc(p.category) + '</span>' +
-      '<span class="chip chip-neutral"><span class="chip-dot"></span>' + esc(pollAreaLabel(p)) + '</span>' +
-      '<span class="chip ' + (p.status==='open'?'chip-accent':'chip-neutral') + '"><span class="chip-dot"></span>' + (p.status==='open'?'Open':'Closed') + '</span></div>' +
-      '<h2 class="poll-title" style="font-size:23px;">' + esc(p.title) + '</h2>' +
-      '<div class="poll-budget" style="margin-bottom:10px;">' + fmtMoney(p.budgetAmount) + ' proposed</div>' +
-      '<p style="color:var(--ink-2); font-size:14.5px; line-height:1.6;">' + esc(p.description) + '</p>' +
-      (existing ? '<div class="banner" style="margin-bottom:10px;">You already recorded a vote of "' + esc((p.options.filter(function(o){return o.id===existing.optionId;})[0]||{}).label || '—') + '" on this item — picking a different option below will update it.</div>' : '') +
-      '<div class="options-grid" style="margin:18px 0;">' +
+    var body = '' +
+    '<div class="poll-meta" style="margin-bottom:6px;"><span class="chip chip-neutral"><span class="chip-dot"></span>' + esc(p.category) + '</span>' +
+    '<span class="chip chip-neutral"><span class="chip-dot"></span>' + esc(pollAreaLabel(p)) + '</span>' +
+    '<span class="chip ' + (p.status==='open'?'chip-accent':'chip-neutral') + '"><span class="chip-dot"></span>' + (p.status==='open'?'Open':'Closed') + '</span></div>' +
+    '<h2 class="poll-title" style="font-size:23px;">' + esc(p.title) + '</h2>' +
+    '<div class="poll-budget" style="margin-bottom:10px;">' + fmtMoney(p.budgetAmount) + ' proposed</div>' +
+    '<p style="color:var(--ink-2); font-size:14.5px; line-height:1.6;">' + esc(p.description) + '</p>';
+
+    if(existing){
+      body += '<div class="chip chip-good" style="width:fit-content; margin-bottom:16px;"><span class="chip-dot"></span>You voted: ' +
+        esc((p.options.filter(function(o){ return o.id === existing.optionId; })[0] || {}).label || '—') + '</div>' +
+        '<div class="disclosure" style="margin-bottom:16px;">Council votes are final once cast, the same way a real roll-call vote is — this can\'t be changed.</div>' +
+        '<div class="poll-actions"><button class="btn btn-ghost" data-back="council">Back</button></div>';
+    } else {
+      body += '<div class="options-grid" style="margin:18px 0;">' +
         p.options.map(function(o){
           var sel = S.selectedOptionId === o.id;
           return '<div class="opt-card ' + (sel?'selected':'') + '" data-selopt="' + o.id + '"><div class="opt-head"><span class="opt-radio"></span><span class="opt-label">' + esc(o.label) + '</span></div></div>';
         }).join('') +
       '</div>' +
-      '<div class="disclosure" style="margin-bottom:16px;">Unlike resident ballots, council votes are attributed — residents will see your name next to your choice once this item closes.</div>' +
+      '<div class="disclosure" style="margin-bottom:16px;">Unlike resident ballots, council votes are attributed — residents will see your name next to your choice once this item closes. Once cast, this can\'t be changed.</div>' +
       '<div class="poll-actions">' +
-        '<button class="btn btn-primary" id="submitCouncilVoteBtn" ' + ((S.selectedOptionId && !S.voteBusy)?'':'disabled') + '>' + (S.voteBusy?'Submitting…':(existing?'Update council vote':'Cast council vote')) + '</button>' +
+        '<button class="btn btn-primary" id="submitCouncilVoteBtn" ' + ((S.selectedOptionId && !S.voteBusy)?'':'disabled') + '>' + (S.voteBusy?'Submitting…':'Cast council vote') + '</button>' +
         '<button class="btn btn-ghost" data-back="council">Cancel</button>' +
-      '</div>' +
-    '</div>';
+      '</div>';
+    }
+
+    return '<div class="card pad-lg" style="max-width:640px;">' + body + '</div>';
   }
 
   function renderHistory(){
@@ -1223,6 +1260,13 @@
         (ballot ? '<div class="chip chip-good" style="width:fit-content;"><span class="chip-dot"></span>You voted: ' + esc((p.options.filter(function(o){return o.id===ballot.optionId;})[0]||{}).label || '—') + '</div>' : '<div class="chip chip-neutral" style="width:fit-content;"><span class="chip-dot"></span>You did not vote</div>');
       if(p.status==='closed'){
         body += res ? renderBars(p, res) : '<button class="btn btn-ghost btn-sm" data-loadresults="' + p.id + '">Show results</button>';
+      } else {
+        // Still open: keep the resident tally itself hidden (an early
+        // count could sway still-open voting), but council's vote is
+        // deliberately transparent regardless of the poll's status — see
+        // renderCouncilVoteSummary(). Auto-fetched by refreshMyBallots()'s
+        // continuation, not gated behind a manual "Show results" click.
+        body += renderCouncilVoteSummary(p, res);
       }
       body += '</div>';
       return body;
@@ -1245,36 +1289,42 @@
       '<span class="mono tnum">' + total + ' of ' + res.eligible + ' verified residents</span>' +
       '<div class="turnout-track"><div class="turnout-fill" style="width:' + turnoutPct + '%;"></div></div>' +
       '<span class="mono tnum">' + turnoutPct + '%</span></div>';
+    html += renderCouncilVoteSummary(p, res);
+    html += '</div>';
+    return html;
+  }
 
-    // Accountability tracking: how council actually voted on the same
-    // item, right alongside what residents voted for. Unlike the bars
-    // above, council's votes are attributed by name (see
-    // cast_council_vote()/council_votes in 0001_init.sql for why) —
-    // that's the whole point of this section.
-    if(res.councilVotes){
-      var councilTotal = res.councilVotes.length;
-      html += '<div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--border);">';
-      html += '<div style="font-size:12.5px; font-weight:700; color:var(--ink-2); margin-bottom:8px;">How council voted</div>';
-      if(councilTotal){
-        p.options.forEach(function(o, i){
-          var n = (res.councilCounts && res.councilCounts[o.id]) || 0;
-          var pct = councilTotal ? Math.round(1000*n/councilTotal)/10 : 0;
-          html += '<div class="bar-row"><div class="lbl">' + esc(o.label) + '</div>' +
-            '<div class="bar-track"><div class="bar-fill" style="width:' + (councilTotal? Math.max(pct,1.5):0) + '%; background:' + CAT_COLORS[i % CAT_COLORS.length] + ';"></div></div>' +
-            '<div class="bar-pct tnum">' + n + ' (' + pct + '%)</div></div>';
-        });
-        html += '<div style="font-size:12.5px; color:var(--ink-2); margin-top:8px;">' +
-          res.councilVotes.map(function(v){
-            var label = (p.options.filter(function(o){ return o.id === v.optionId; })[0] || {}).label || '—';
-            return esc(v.fullName) + ': ' + esc(label);
-          }).join(' · ') +
-        '</div>';
-      } else {
-        html += '<div style="font-size:13px; color:var(--ink-muted);">Council has not recorded a vote on this item yet.</div>';
-      }
-      html += '</div>';
+  // Accountability tracking: how council actually voted on the same item.
+  // Deliberately shown regardless of whether the poll has closed yet, and
+  // regardless of whether the resident tally itself is visible — unlike
+  // resident ballots (which stay hidden until a poll closes, so an early
+  // tally can't sway still-open voting), council's votes are meant to be
+  // transparent as soon as they're cast, attributed by name (see
+  // cast_council_vote()/council_votes in 0001_init.sql for why). Split out
+  // from renderBars() so it can also show up on still-open polls in
+  // renderHistory(), not just alongside the closed-poll resident tally.
+  function renderCouncilVoteSummary(p, res){
+    if(!res || !res.councilVotes) return '';
+    var councilTotal = res.councilVotes.length;
+    var html = '<div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--border);">';
+    html += '<div style="font-size:12.5px; font-weight:700; color:var(--ink-2); margin-bottom:8px;">How council voted</div>';
+    if(councilTotal){
+      p.options.forEach(function(o, i){
+        var n = (res.councilCounts && res.councilCounts[o.id]) || 0;
+        var pct = councilTotal ? Math.round(1000*n/councilTotal)/10 : 0;
+        html += '<div class="bar-row"><div class="lbl">' + esc(o.label) + '</div>' +
+          '<div class="bar-track"><div class="bar-fill" style="width:' + (councilTotal? Math.max(pct,1.5):0) + '%; background:' + CAT_COLORS[i % CAT_COLORS.length] + ';"></div></div>' +
+          '<div class="bar-pct tnum">' + n + ' (' + pct + '%)</div></div>';
+      });
+      html += '<div style="font-size:12.5px; color:var(--ink-2); margin-top:8px;">' +
+        res.councilVotes.map(function(v){
+          var label = (p.options.filter(function(o){ return o.id === v.optionId; })[0] || {}).label || '—';
+          return esc(v.fullName) + ': ' + esc(label);
+        }).join(' · ') +
+      '</div>';
+    } else {
+      html += '<div style="font-size:13px; color:var(--ink-muted);">Council has not recorded a vote on this item yet.</div>';
     }
-
     html += '</div>';
     return html;
   }
@@ -1379,7 +1429,7 @@
       btn.onclick = function(){
         var key = btn.getAttribute('data-nav');
         if(key==='resident'){ S.view='resident'; }
-        else if(key==='history'){ S.view='history'; }
+        else if(key==='history'){ S.view='history'; refreshCouncilTransparency(true); }
         else if(key==='council-new'){ S.view='council'; S.councilTab='new'; }
         else if(key==='council-manage'){ S.view='council'; S.councilTab='manage'; }
         else if(key==='council-verify'){ S.view='council'; S.councilTab='verify'; }

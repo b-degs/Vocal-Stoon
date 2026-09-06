@@ -178,19 +178,38 @@ table, `cast_council_vote()` RPC — "Cast council vote" in Manage Votes),
 and `poll_results()` folds that into the same payload residents already
 fetch for results (`councilCounts` — an aggregate tally, same shape as
 `counts` — and `councilVotes`, the attributed list of who voted for what).
-`renderBars()` (shared by the resident History tab and council's Manage
-Votes) shows a "How council voted" section right under the resident tally
-whenever it's present, so a resident can directly compare what they voted
-for against what council actually decided.
 
-Deliberately **not** anonymous, unlike `poll_ballots`: a councilperson's
-real vote on a public budget item is public record in real municipal
-government, and the whole point of this feature is letting residents see
-it, by name. A council member can re-cast to update their own vote (it's
-an upsert, not a one-shot roll call) — right for a pilot where council may
-want to revise before residents see it; tighten this (e.g., lock it once
-the poll closes) if that flexibility turns out to be a problem in
-practice. Council can vote regardless of the poll's open/closed status —
+Two things worth being explicit about, since both were corrected from an
+initial pass based on direct product feedback:
+
+1. **A council vote is final once cast — not an upsert.** `cast_council_vote()`
+   rejects a second attempt from the same council member on the same item
+   (`"You already cast your council vote on this item."`), the same way
+   `cast_vote()` rejects a resident double-voting — a real, database-enforced
+   guard (the `(poll_id, resident_id)` primary key), not just a client-side
+   restriction. `renderCouncilVoteScreen()` reflects this: once a council
+   member has voted, they see a locked "You voted: X" state instead of an
+   editable picker — there's no "Update" path at all, by design, matching a
+   real roll-call vote.
+2. **Council's vote is visible to residents immediately, not gated behind
+   the poll closing or a manual "Show results" click.** `renderCouncilVoteSummary()`
+   (split out of `renderBars()`) shows the "How council voted" section on
+   *any* poll a resident is following, open or closed — this is what
+   "accountability" actually requires: a resident should be able to see how
+   their council member voted without waiting. The resident tally itself
+   (`renderBars()`'s bars) still stays hidden until a poll closes, unchanged
+   from before — an early count of residents' own in-progress votes could
+   sway still-open voting; that reasoning doesn't apply to council's vote.
+   `refreshCouncilTransparency()` keeps this fed: it's called after a
+   resident's poll list refreshes, right after they cast their own vote,
+   and every time they open the History tab (forced, so it's never stale
+   just because it was fetched once already) — there's no live push for
+   this specifically (Realtime is only wired to the `polls` table itself,
+   not `council_votes`), so a resident already sitting on an open History
+   tab won't see a council vote the instant it's cast, only at those
+   refresh points.
+
+Council can still vote regardless of the poll's open/closed status —
 nothing here enforces a particular order between "residents vote" and
 "council decides."
 
