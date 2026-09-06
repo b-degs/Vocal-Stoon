@@ -677,7 +677,7 @@
     // copied/leaked token can't be replayed after this point, unlike a
     // JWT (which would stay valid until it expired regardless). Don't
     // block the UI on it either way; the local token is cleared next.
-    if(CURRENT_TOKEN) sb.rpc('sign_out', withToken()).catch(function(){});
+    if(CURRENT_TOKEN) sb.rpc('sign_out', withToken()).then(function(){}, function(){});
     setSession(null);
     S = Object.assign({}, S, { currentUser:null, view:'login', authTab:'signin', authError:'', polls:[], residents:[], myBallots:{}, pollResults:{}, notifications:[], notifOpen:false });
     render();
