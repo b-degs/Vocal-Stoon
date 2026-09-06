@@ -224,6 +224,17 @@ entirely (there's no single "winner" to compare), rather than guessing
 which way to count it. The card only appears once there's at least one
 poll where both sides have a clear winner to compare.
 
+**Per-member voting record.** Right below that, `renderCouncilRecords()`
+(`computeCouncilRecords()`) lists each council member by name with their
+own track record: a per-member "matched residents X% of the time" stat,
+then every closed poll they've voted on with their choice and whether it
+matched residents' pick. Also built entirely client-side from the same
+already-loaded `poll_results()` data — `councilVotes` carries each voter's
+name and choice regardless of who's asking (any signed-in resident, not
+just council), so this needed no new roster-access RPC. Grouped by
+resident id rather than name, in case two council members ever share one.
+Shown on both the resident History tab and council's own Manage Votes.
+
 ## Before this decides a real vote
 
 `complete_self_verification()` is still a **simulation** — no real photo,

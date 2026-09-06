@@ -1310,9 +1310,71 @@
     '</div>';
   }
 
+  // Per-council-member voting record, built purely from poll_results()
+  // data already loaded for every closed poll — councilVotes carries each
+  // voter's name and choice regardless of who's asking (any signed-in
+  // resident, not just council), so no separate roster call is needed
+  // here. Grouped by resident id (not name) in case two council members
+  // ever share a name.
+  function computeCouncilRecords(){
+    var byMember = {};
+    S.polls.forEach(function(p){
+      if(p.status !== 'closed') return;
+      var res = S.pollResults[p.id];
+      if(!res || !res.councilVotes) return;
+      var residentWinner = winningOptionId(res.counts);
+      res.councilVotes.forEach(function(v){
+        if(!byMember[v.residentId]) byMember[v.residentId] = { residentId: v.residentId, fullName: v.fullName, votes: [] };
+        var label = (p.options.filter(function(o){ return o.id === v.optionId; })[0] || {}).label || '—';
+        byMember[v.residentId].votes.push({
+          title: p.title,
+          optionLabel: label,
+          closedAt: p.closedAt,
+          // null when residents' own vote was a tie (or nobody voted) —
+          // nothing to compare this member's choice against.
+          matchedResidents: residentWinner ? (residentWinner === v.optionId) : null
+        });
+      });
+    });
+    return Object.keys(byMember).map(function(id){ return byMember[id]; })
+      .sort(function(a,b){ return a.fullName.localeCompare(b.fullName); });
+  }
+
+  function renderCouncilRecords(){
+    var records = computeCouncilRecords();
+    if(!records.length) return '';
+    return '' +
+    '<div class="card pad-lg" style="margin-bottom:18px;">' +
+      '<div style="font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; color:var(--ink-muted); margin-bottom:4px;">Council voting record</div>' +
+      records.map(function(m){
+        var comparable = m.votes.filter(function(v){ return v.matchedResidents !== null; });
+        var alignedCount = comparable.filter(function(v){ return v.matchedResidents === true; }).length;
+        var pct = comparable.length ? Math.round(100 * alignedCount / comparable.length) : null;
+        return '' +
+        '<div style="padding:12px 0; border-top:1px solid var(--border);">' +
+          '<div style="display:flex; justify-content:space-between; align-items:baseline; gap:10px; flex-wrap:wrap;">' +
+            '<div style="font-weight:700; font-size:14px;">' + esc(m.fullName) + '</div>' +
+            (pct !== null ? '<div style="font-size:12px; color:var(--ink-muted);">Matched residents ' + pct + '% of the time (' + alignedCount + ' of ' + comparable.length + ')</div>' : '') +
+          '</div>' +
+          '<div style="margin-top:8px; display:flex; flex-direction:column; gap:6px;">' +
+            m.votes.map(function(v){
+              var chip = v.matchedResidents === true ? '<span class="chip chip-good" style="padding:2px 9px; font-size:11px;">Matched residents</span>' :
+                         v.matchedResidents === false ? '<span class="chip chip-critical" style="padding:2px 9px; font-size:11px;">Differed</span>' :
+                         '<span class="chip chip-neutral" style="padding:2px 9px; font-size:11px;">No clear resident pick</span>';
+              return '<div style="display:flex; justify-content:space-between; align-items:center; gap:10px; font-size:13px;">' +
+                '<span style="color:var(--ink-2);">' + esc(v.title) + ' <span class="mono" style="color:var(--ink);">— ' + esc(v.optionLabel) + '</span></span>' +
+                chip +
+              '</div>';
+            }).join('') +
+          '</div>' +
+        '</div>';
+      }).join('') +
+    '</div>';
+  }
+
   function renderHistory(){
     var mine = S.polls.filter(function(p){ return (S.myBallots[p.id] || p.status==='closed') && pollVisibleToResident(p, S.currentUser); });
-    var summary = renderCouncilAlignmentSummary();
+    var summary = renderCouncilAlignmentSummary() + renderCouncilRecords();
     if(!mine.length) return summary + '<div class="empty">Nothing here yet — items you\'ve voted on will appear once you cast a vote.</div>';
     return summary + mine.map(function(p){
       var ballot = S.myBallots[p.id];
@@ -1432,7 +1494,7 @@
   /* ---------- Council: manage ---------- */
   function renderCouncilManage(){
     if(!S.polls.length) return '<div class="empty">No votes have been opened yet. Use "Open a New Vote" to publish the first one.</div>';
-    var summary = renderCouncilAlignmentSummary();
+    var summary = renderCouncilAlignmentSummary() + renderCouncilRecords();
     return summary + S.polls.map(function(p){
       var res = S.pollResults[p.id];
       var expanded = S.expandedResults[p.id];
