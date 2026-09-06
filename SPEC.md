@@ -170,6 +170,30 @@ why so you don't accidentally undo them:
    else's, never to `'rejected'`. The feature and its UX are unchanged;
    only the blast radius of a client bug or malicious client is.
 
+## Council voting / accountability tracking
+
+A first cut of the "Accountability tracking" roadmap idea (below) is now
+built: council members can cast their own vote on an item (`council_votes`
+table, `cast_council_vote()` RPC — "Cast council vote" in Manage Votes),
+and `poll_results()` folds that into the same payload residents already
+fetch for results (`councilCounts` — an aggregate tally, same shape as
+`counts` — and `councilVotes`, the attributed list of who voted for what).
+`renderBars()` (shared by the resident History tab and council's Manage
+Votes) shows a "How council voted" section right under the resident tally
+whenever it's present, so a resident can directly compare what they voted
+for against what council actually decided.
+
+Deliberately **not** anonymous, unlike `poll_ballots`: a councilperson's
+real vote on a public budget item is public record in real municipal
+government, and the whole point of this feature is letting residents see
+it, by name. A council member can re-cast to update their own vote (it's
+an upsert, not a one-shot roll call) — right for a pilot where council may
+want to revise before residents see it; tighten this (e.g., lock it once
+the poll closes) if that flexibility turns out to be a problem in
+practice. Council can vote regardless of the poll's open/closed status —
+nothing here enforces a particular order between "residents vote" and
+"council decides."
+
 ## Before this decides a real vote
 
 `complete_self_verification()` is still a **simulation** — no real photo,

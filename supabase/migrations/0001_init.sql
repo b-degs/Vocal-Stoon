@@ -227,6 +227,57 @@ alter table poll_ballots enable row level security;
 -- (aggregate select) touch this table — nobody can select raw ballot rows
 -- over the API, even though the rows carry no identity to begin with.
 
+-- ---------------------------------------------------------------------
+-- council_votes — accountability tracking: how each council member
+-- actually voted on an item, vs. what residents favored. Deliberately
+-- attributed (unlike poll_ballots/poll_voters) — a councilperson's real
+-- vote on a budget item is public record in real municipal government,
+-- not a secret ballot; the whole point of this table is letting residents
+-- see whether council's actual decision matched what they voted for.
+-- One row per (poll, council member) — casting again just updates it,
+-- rather than being a one-shot roll-call vote, since this is still a
+-- pilot and council may want to revise before residents see it.
+-- ---------------------------------------------------------------------
+create table if not exists council_votes (
+  poll_id uuid not null references polls(id) on delete cascade,
+  resident_id text not null references residents(id),
+  option_id text not null,
+  voted_at timestamptz not null default now(),
+  primary key (poll_id, resident_id)
+);
+alter table council_votes enable row level security;
+-- No direct policies: only cast_council_vote() (insert/update) and
+-- poll_results() (folded into its existing payload, see below) touch
+-- this — same "no direct API access, only through a function" pattern as
+-- every other table here.
+
+-- Council casts (or updates) their own vote on an item. Any council
+-- member can vote regardless of the poll's open/closed status — this
+-- doesn't force a particular process (residents vote, then council
+-- decides, in whatever order actually happens) — but only a council
+-- session can call it, and only for one of the poll's real options.
+create or replace function cast_council_vote(p_session_token uuid, p_poll_id uuid, p_option_id text) returns void
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
+declare
+  v_caller residents := session_resident(p_session_token);
+  v_poll polls;
+begin
+  if v_caller.id is null or v_caller.role <> 'council' then
+    raise exception 'Council access required.' using errcode = '42501';
+  end if;
+  select * into v_poll from polls where id = p_poll_id;
+  if not found then raise exception 'This vote is no longer available.' using errcode = '22023'; end if;
+  if not exists (select 1 from jsonb_array_elements(v_poll.options) o where o->>'id' = p_option_id) then
+    raise exception 'Not a valid option for this vote.' using errcode = '22023';
+  end if;
+
+  insert into council_votes (poll_id, resident_id, option_id)
+  values (p_poll_id, v_caller.id, p_option_id)
+  on conflict (poll_id, resident_id) do update set option_id = excluded.option_id, voted_at = now();
+end;
+$$;
+grant execute on function cast_council_vote(uuid,uuid,text) to anon, authenticated;
+
 -- Normalizes free-text the same way the old client-side normalizeText()
 -- did — trims, collapses whitespace, lowercases — so sign-in stays
 -- forgiving about spacing/case in name and address.
@@ -542,12 +593,21 @@ grant execute on function my_voted_polls(uuid) to anon, authenticated;
 -- computeResults() in the client. Requires a valid session (any
 -- signed-in resident, not just council) — matches the old "must be
 -- authenticated" intent from the JWT-based draft.
+--
+-- Also folds in council's own vote on the same item — councilCounts (an
+-- aggregate tally, same shape as counts) and councilVotes (the attributed
+-- list: which council member voted for what, by name) — so a resident
+-- viewing results sees both what residents favored AND what council
+-- actually decided, in one call. Unlike poll_ballots, council_votes rows
+-- ARE attributed on purpose (see the comment on that table above).
 create or replace function poll_results(p_session_token uuid, p_poll_id uuid) returns jsonb
 language plpgsql security definer stable set search_path = pg_catalog, public, extensions as $$
 declare
   v_caller residents := session_resident(p_session_token);
   v_poll polls;
   v_counts jsonb := '{}'::jsonb;
+  v_council_counts jsonb := '{}'::jsonb;
+  v_council_votes jsonb;
   v_total int;
   v_eligible int;
   r record;
@@ -569,6 +629,23 @@ begin
     v_counts := v_counts || jsonb_build_object(r.option_id, r.n);
   end loop;
 
+  for r in
+    select o->>'id' as option_id,
+           count(cv.poll_id) as n
+    from jsonb_array_elements(v_poll.options) o
+    left join council_votes cv on cv.poll_id = p_poll_id and cv.option_id = o->>'id'
+    group by o->>'id'
+  loop
+    v_council_counts := v_council_counts || jsonb_build_object(r.option_id, r.n);
+  end loop;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'residentId', cv.resident_id, 'fullName', res.full_name, 'optionId', cv.option_id
+         ) order by res.full_name), '[]'::jsonb)
+  into v_council_votes
+  from council_votes cv join residents res on res.id = cv.resident_id
+  where cv.poll_id = p_poll_id;
+
   select count(*) into v_total from poll_ballots where poll_id = p_poll_id;
 
   select count(*) into v_eligible
@@ -577,7 +654,10 @@ begin
     and (v_poll.eligible_ridings is null or array_length(v_poll.eligible_ridings,1) is null
          or riding = any(v_poll.eligible_ridings));
 
-  return jsonb_build_object('counts', v_counts, 'total', v_total, 'eligible', greatest(v_eligible, v_total));
+  return jsonb_build_object(
+    'counts', v_counts, 'total', v_total, 'eligible', greatest(v_eligible, v_total),
+    'councilCounts', v_council_counts, 'councilVotes', v_council_votes
+  );
 end;
 $$;
 grant execute on function poll_results(uuid,uuid) to anon, authenticated;
