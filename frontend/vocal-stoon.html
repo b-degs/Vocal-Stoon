@@ -500,6 +500,7 @@
       refreshMyBallots().then(function(){
         refreshNotifications();
         refreshCouncilTransparency(false);
+        refreshCouncilOwnResults();
         render();
       });
     }
@@ -598,6 +599,19 @@
     S.polls.filter(function(p){
       return (S.myBallots[p.id] || p.status === 'closed') && pollVisibleToResident(p, S.currentUser) && (force || !S.pollResults[p.id]);
     }).forEach(function(p){ computeResults(p.id); });
+  }
+
+  // Council-side counterpart: without this, Manage Votes has no way to
+  // know whether THIS council member already voted on a given poll until
+  // results happen to be loaded (previously only via a manual "View
+  // results" click or by voting itself) — so the "Cast council vote"
+  // button stayed visible and clickable even after voting, even though
+  // the server correctly rejected a second attempt. Fetching this
+  // up front lets renderCouncilManage() show a locked "You voted: X" chip
+  // instead, the same way a resident's own poll card behaves.
+  function refreshCouncilOwnResults(){
+    if(!S.currentUser || S.currentUser.role !== 'council') return;
+    S.polls.filter(function(p){ return !S.pollResults[p.id]; }).forEach(function(p){ computeResults(p.id); });
   }
 
   /* ---------------------------------------------------------------------
@@ -1246,10 +1260,61 @@
     return '<div class="card pad-lg" style="max-width:640px;">' + body + '</div>';
   }
 
+  // Picks the option with strictly the most votes in a counts map (as
+  // returned by poll_results — {optionId: n}); null if there were no
+  // votes at all, or a tie for the top spot (no single clear winner to
+  // compare against the other side).
+  function winningOptionId(counts){
+    var bestId = null, bestN = -1, tie = false;
+    Object.keys(counts || {}).forEach(function(id){
+      var n = counts[id];
+      if(n > bestN){ bestN = n; bestId = id; tie = false; }
+      else if(n === bestN){ tie = true; }
+    });
+    return (bestN > 0 && !tie) ? bestId : null;
+  }
+
+  // All-time accountability stat: across every closed poll where both
+  // residents and council actually voted, what share of the time did
+  // council's winning choice match residents' winning choice? Needs
+  // res.counts/res.councilCounts loaded for every closed poll, which
+  // refreshCouncilTransparency()/refreshCouncilOwnResults() keep fed.
+  function computeCouncilAlignmentStats(){
+    var total = 0, aligned = 0;
+    S.polls.forEach(function(p){
+      if(p.status !== 'closed') return;
+      var res = S.pollResults[p.id];
+      if(!res || !res.total || !res.councilVotes || !res.councilVotes.length) return;
+      var residentWinner = winningOptionId(res.counts);
+      var councilWinner = winningOptionId(res.councilCounts);
+      if(!residentWinner || !councilWinner) return;
+      total++;
+      if(residentWinner === councilWinner) aligned++;
+    });
+    return { total: total, aligned: aligned };
+  }
+
+  function renderCouncilAlignmentSummary(){
+    var stats = computeCouncilAlignmentStats();
+    if(!stats.total) return '';
+    var pct = Math.round(100 * stats.aligned / stats.total);
+    return '' +
+    '<div class="card pad-lg" style="margin-bottom:18px;">' +
+      '<div style="font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; color:var(--ink-muted);">Council alignment, all time</div>' +
+      '<div style="display:flex; align-items:baseline; gap:10px; margin:6px 0 10px; flex-wrap:wrap;">' +
+        '<div class="mono" style="font-size:32px; font-weight:600;">' + pct + '%</div>' +
+        '<div style="font-size:13px; color:var(--ink-2);">of decided items, council\'s choice matched what residents voted for</div>' +
+      '</div>' +
+      '<div class="turnout-track"><div class="turnout-fill" style="width:' + pct + '%; background:var(--good);"></div></div>' +
+      '<div style="font-size:12px; color:var(--ink-muted); margin-top:8px;">Based on ' + stats.aligned + ' of ' + stats.total + ' closed items where both residents and council have voted (a tie on either side isn\'t counted either way).</div>' +
+    '</div>';
+  }
+
   function renderHistory(){
     var mine = S.polls.filter(function(p){ return (S.myBallots[p.id] || p.status==='closed') && pollVisibleToResident(p, S.currentUser); });
-    if(!mine.length) return '<div class="empty">Nothing here yet — items you\'ve voted on will appear once you cast a vote.</div>';
-    return mine.map(function(p){
+    var summary = renderCouncilAlignmentSummary();
+    if(!mine.length) return summary + '<div class="empty">Nothing here yet — items you\'ve voted on will appear once you cast a vote.</div>';
+    return summary + mine.map(function(p){
       var ballot = S.myBallots[p.id];
       var res = S.pollResults[p.id];
       var body = '<div class="card poll-card">' +
@@ -1367,10 +1432,16 @@
   /* ---------- Council: manage ---------- */
   function renderCouncilManage(){
     if(!S.polls.length) return '<div class="empty">No votes have been opened yet. Use "Open a New Vote" to publish the first one.</div>';
-    return S.polls.map(function(p){
+    var summary = renderCouncilAlignmentSummary();
+    return summary + S.polls.map(function(p){
       var res = S.pollResults[p.id];
       var expanded = S.expandedResults[p.id];
       var turnoutPct = res && res.eligible ? Math.round(100*res.total/res.eligible) : null;
+      // Same "voted ⇒ locked chip instead of a live button" treatment a
+      // resident's own poll card gets — needs res.councilVotes to be
+      // loaded, which refreshCouncilOwnResults() fetches up front so this
+      // doesn't depend on a manual "View results" click first.
+      var myCouncilVote = res && res.councilVotes ? res.councilVotes.filter(function(v){ return v.residentId === S.currentUser.id; })[0] : null;
       return '<div class="card poll-card">' +
         '<div class="poll-top"><div><div class="poll-title">' + esc(p.title) + '</div>' +
         '<div class="poll-meta"><span class="chip chip-neutral"><span class="chip-dot"></span>' + esc(p.category) + '</span>' +
@@ -1381,7 +1452,9 @@
         (res ? '<div style="font-size:12.5px; color:var(--ink-2);"><span class="mono tnum">' + res.total + '</span> ballots cast so far · <span class="mono tnum">' + (turnoutPct===null?'—':turnoutPct+'%') + '</span> of ' + res.eligible + ' eligible verified residents</div>' : '') +
         '<div class="poll-actions">' +
           '<button class="btn btn-ghost btn-sm" data-refreshresults="' + p.id + '">' + (expanded ? 'Refresh results' : 'View results') + '</button>' +
-          '<button class="btn btn-ghost btn-sm" data-castcouncilvote="' + p.id + '">Cast council vote</button>' +
+          (myCouncilVote
+            ? '<span class="chip chip-good"><span class="chip-dot"></span>You voted: ' + esc((p.options.filter(function(o){return o.id===myCouncilVote.optionId;})[0]||{}).label || '—') + '</span>'
+            : '<button class="btn btn-ghost btn-sm" data-castcouncilvote="' + p.id + '">Cast council vote</button>') +
           (p.status==='open' ? '<button class="btn btn-danger btn-sm" data-closepoll="' + p.id + '">Close voting</button>' : '<button class="btn btn-ghost btn-sm" data-reopenpoll="' + p.id + '">Reopen</button>') +
           (res ? '<button class="btn btn-ghost btn-sm" data-exportcsv="' + p.id + '">Export CSV</button>' : '') +
         '</div>' +

@@ -213,6 +213,17 @@ Council can still vote regardless of the poll's open/closed status —
 nothing here enforces a particular order between "residents vote" and
 "council decides."
 
+**All-time alignment stat.** Both the resident History tab and council's
+Manage Votes now show a summary card (`renderCouncilAlignmentSummary()`):
+across every *closed* poll where both sides actually voted, what share of
+the time did council's winning option match residents' winning option?
+Computed entirely client-side from already-loaded `poll_results()` data —
+no new RPC. `winningOptionId()` picks whichever option has strictly the
+most votes; a tie on either side excludes that poll from the stat
+entirely (there's no single "winner" to compare), rather than guessing
+which way to count it. The card only appears once there's at least one
+poll where both sides have a clear winner to compare.
+
 ## Before this decides a real vote
 
 `complete_self_verification()` is still a **simulation** — no real photo,
