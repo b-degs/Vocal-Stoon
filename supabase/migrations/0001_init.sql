@@ -6,35 +6,42 @@
 -- security shortcuts that were acceptable ONLY inside the sandboxed
 -- prototype (see "SECURITY NOTES" at the bottom of this file).
 --
+-- AUTH MODEL: this app's login is full name + address + ward + password —
+-- no email, no username. An earlier draft of this migration tried to mint
+-- its own PostgREST-verifiable JWTs (via the pgjwt extension) for this,
+-- the way several Supabase "bring your own auth" tutorials describe. That
+-- approach was built, tested against a local Postgres instance, and then
+-- found to NOT work against a real project: PostgREST there verifies
+-- Bearer tokens against the project's actual JWKS (its published Auth
+-- signing keys), and a project can use ES256/RS256 signing keys with NO
+-- HS256 entry available at all — confirmed by fetching this exact
+-- project's own /auth/v1/.well-known/jwks.json. A token signed with a
+-- plain HS256 secret can never verify there, no matter how the secret or
+-- a "kid" is set up on our end; it's a fundamental algorithm mismatch, not
+-- a config bug.
+--
+-- So this build uses a plain session table instead (see `sessions` below)
+-- and never asks PostgREST's JWT layer to vouch for anyone. Every RPC that
+-- needs to know who's calling takes an explicit `p_session_token`
+-- parameter and looks it up itself via `session_resident()`. This is less
+-- "clever" than minting real JWTs, but it works regardless of whatever
+-- signing keys a given Supabase project happens to use, now or after any
+-- future change on Supabase's end — nothing here depends on their key
+-- configuration at all.
+--
 -- ONE-TIME MANUAL SETUP after running this migration:
---   1. In the Supabase dashboard: Settings -> API -> "JWT Keys" -> copy the
---      current key's secret. If your project only shows asymmetric signing
---      keys (ES256/RS256 — no plain secret string anywhere), rotate to a
---      shared-secret key first: "Create standby key" -> choose HS256 /
---      "Legacy shared secret" -> promote it to current -> switch to the
---      "Legacy" view to reveal the actual secret string. See SPEC.md
---      "Auth caveat" for why this build needs a plain HS256 secret.
---   2. Run once, with your real values substituted in:
---        update app_config set jwt_secret = '<paste-your-secret>',
---                               council_code = '<pick-a-real-code>';
---      (Older guidance for this kind of setting says
---      `ALTER DATABASE ... SET app.foo = ...` — as of this build, Supabase
---      denies that outright on at least some projects, even to the SQL
---      Editor's own role, on both the database and any role
---      ("permission denied to set parameter"). The app_config table below
---      sidesteps that: it only needs the same ordinary table-owner
---      privilege you already have from running this migration.)
+--   Run once, with your own council signup code substituted in (replaces
+--   the hardcoded demo "STOON-COUNCIL" constant the old client-side-only
+--   version used):
+--     update app_config set council_code = '<pick-a-real-code>' where id = true;
 -- =====================================================================
 
--- Supabase installs pgcrypto (and would install pgjwt) into a schema
--- called `extensions`, not `public` — confirmed on a real project while
--- building this. Installing both explicitly into that same schema keeps
--- pgjwt's internal calls to pgcrypto's hmac()/etc. resolving correctly;
--- leaving pgjwt to default to `public` (the failure mode this comment is
--- warning about) breaks it with "function public.hmac(...) does not
--- exist" the first time sign_up()/sign_in() actually run.
+-- Supabase installs pgcrypto into a schema called `extensions`, not
+-- `public` — installing it there explicitly keeps this working the same
+-- way whether or not Supabase's own provisioning already did it first
+-- (CREATE EXTENSION IF NOT EXISTS is a no-op either way if it's already
+-- installed anywhere).
 create extension if not exists pgcrypto with schema extensions;   -- crypt()/gen_salt() password hashing
-create extension if not exists pgjwt with schema extensions;      -- sign() for minting our own session JWTs
 
 -- Every anon/authenticated role can, by default, CREATE TEMP TABLE in this
 -- database (Postgres's default PUBLIC privilege) — and Postgres always
@@ -46,8 +53,8 @@ create extension if not exists pgjwt with schema extensions;      -- sign() for 
 -- instead of the real one — no `set search_path` on those functions can
 -- prevent this, because search_path settings don't affect temp-schema
 -- lookup for relations. This was verified to be a real, working exploit
--- (a forged council session token) against this schema before this line
--- was added; do not remove it.
+-- (a forged council session) against this schema before this line was
+-- added; do not remove it.
 do $$ begin
   execute format('revoke temporary on database %I from public', current_database());
 end $$;
@@ -101,61 +108,57 @@ alter table residents enable row level security;
 -- Intentionally NO policies here for anon/authenticated: the table is
 -- fully locked down from direct PostgREST access. Every legitimate way in
 -- or out goes through a SECURITY DEFINER function below (sign_up, sign_in,
--- get_my_profile, complete_self_verification, council_set_verification) or
--- the residents_public view (council roster only, no password_hash).
+-- get_my_profile, complete_self_verification, council_set_verification,
+-- residents_roster).
 
 -- ---------------------------------------------------------------------
--- app_config — holds the JWT signing secret and the council signup code.
--- A plain locked-down table instead of the Postgres GUCs
--- (`ALTER DATABASE ... SET app.foo = ...`) earlier drafts of this
--- migration used: confirmed on a real Supabase project that newer projects
--- deny `ALTER DATABASE`/`ALTER ROLE` for custom parameters outright
--- ("permission denied to set parameter"), even to the SQL Editor's own
--- role. A table needs no special privilege beyond normal DML on something
--- you own, and RLS with zero policies keeps it exactly as unreadable over
--- the API as residents/poll_ballots are — see the one-time setup note at
--- the top of this file for the `update app_config set ...` to run after
--- this migration.
+-- app_config — just the council signup code now (see the auth-model note
+-- at the top of this file for why there's no jwt_secret column anymore).
+-- A plain locked-down table rather than a Postgres GUC
+-- (`ALTER DATABASE ... SET app.foo = ...`): confirmed on a real Supabase
+-- project that newer projects deny ALTER DATABASE/ALTER ROLE for custom
+-- parameters outright ("permission denied to set parameter"), even to the
+-- SQL Editor's own role. A table needs no special privilege beyond normal
+-- DML on something you own.
 -- ---------------------------------------------------------------------
 create table if not exists app_config (
   id boolean primary key default true check (id),   -- singleton-row guard
-  jwt_secret text,
   council_code text
 );
 insert into app_config (id) values (true) on conflict (id) do nothing;
 alter table app_config enable row level security;
--- No policies: fully locked from anon/authenticated. Only
--- mint_session_token()/sign_up() (both SECURITY DEFINER) ever read it.
+-- No policies: fully locked from anon/authenticated. Only sign_up() ever
+-- reads it.
 
--- =====================================================================
--- JWT / auth helper functions
--- =====================================================================
--- Reads the custom claims off whatever JWT PostgREST verified for this
--- request. Our sign_in()/sign_up() functions mint that JWT themselves
--- (see below) — this is NOT Supabase's built-in GoTrue auth, because the
--- app's login fields are full name + address + ward + password, not an
--- email/username. See SPEC.md "Auth model" for why.
--- Defined here (before polls' RLS policies) because those policies call
--- is_council()/current_resident_role() — Postgres resolves a policy's
--- expression at CREATE POLICY time, so the functions must already exist.
-create or replace function current_jwt_claims() returns jsonb
-language sql stable as $$
-  select coalesce(current_setting('request.jwt.claims', true)::jsonb, '{}'::jsonb)
-$$;
+-- ---------------------------------------------------------------------
+-- sessions — replaces "mint a JWT" entirely (see the auth-model note at
+-- the top of this file). A resident's/council member's session is just a
+-- random token in this table pointing at their resident row, with a
+-- 12-hour expiry — matches the app's "re-verify identity every sign-in"
+-- design intent, same as the JWT-based approach this replaced. No direct
+-- policies: only sign_up()/sign_in() (insert), sign_out() (delete), and
+-- session_resident() (select, via SECURITY DEFINER) ever touch it.
+-- ---------------------------------------------------------------------
+create table if not exists sessions (
+  token uuid primary key default gen_random_uuid(),
+  resident_id text not null references residents(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null
+);
+create index if not exists sessions_resident_idx on sessions (resident_id);
+alter table sessions enable row level security;
+-- No policies: fully locked to direct access, by design.
 
-create or replace function current_resident_id() returns text
-language sql stable as $$
-  select current_jwt_claims()->>'resident_id'
-$$;
-
-create or replace function current_resident_role() returns text
-language sql stable as $$
-  select current_jwt_claims()->>'resident_role'
-$$;
-
-create or replace function is_council() returns boolean
-language sql stable as $$
-  select current_resident_role() = 'council'
+-- Resolves a session token to the resident row it belongs to, or a
+-- null-fields row if the token is missing/unknown/expired — every
+-- caller-identity check below goes through this, instead of the old
+-- current_resident_id()/current_resident_role() JWT-claim readers.
+create or replace function session_resident(p_session_token uuid) returns residents
+language sql stable security definer set search_path = pg_catalog, public, extensions as $$
+  select r.* from sessions s
+  join residents r on r.id = s.resident_id
+  where s.token = p_session_token and s.expires_at > now()
+  limit 1
 $$;
 
 -- ---------------------------------------------------------------------
@@ -180,18 +183,18 @@ create table if not exists polls (
 
 alter table polls enable row level security;
 
-create policy polls_select_authenticated on polls
+-- Readable by anyone, signed in or not — without a JWT-verified role to
+-- gate on, there's no lightweight way to require "must be signed in" at
+-- the RLS layer any more, and these are public municipal budget votes
+-- anyway (a minor, disclosed behavior change from the JWT-based draft:
+-- poll titles/descriptions/budgets are now visible to a logged-out
+-- visitor; voting, the roster, and results still are not). Writes are
+-- NOT open here — no insert/update policy means both are denied by
+-- default; the only way to create or change a poll is create_poll()/
+-- set_poll_status() below, which check for council themselves.
+create policy polls_select_all on polls
   for select
-  using (current_resident_role() is not null);   -- must be signed in; see helper fns below
-
-create policy polls_insert_council on polls
-  for insert
-  with check (is_council());
-
-create policy polls_update_council on polls
-  for update
-  using (is_council())
-  with check (is_council());
+  using (true);
 
 -- ---------------------------------------------------------------------
 -- poll_voters — "this resident voted" flag only. No option/choice here.
@@ -224,67 +227,12 @@ alter table poll_ballots enable row level security;
 -- (aggregate select) touch this table — nobody can select raw ballot rows
 -- over the API, even though the rows carry no identity to begin with.
 
--- Council-only view of the roster, minus password_hash. Regular residents
--- never need this (they use get_my_profile() for their own row) but the
--- policy also lets a resident read their own row here as a harmless
--- fallback.
---
--- Deliberately NOT `security_invoker = true`. `residents` has RLS enabled
--- with zero policies for anon/authenticated, which means a security-invoker
--- view querying it as the caller's role would always see zero rows,
--- regardless of this view's own WHERE clause — Postgres's RLS default-deny
--- applies before the view's predicate does. Leaving this at the default
--- (security_invoker = false) makes the view run as its owner (the
--- migration role), which is exempt from residents' RLS since the table was
--- never given FORCE ROW LEVEL SECURITY — so the owner can see the rows, and
--- this view's own WHERE clause (checked against the real caller's JWT
--- claims via is_council()/current_resident_id(), which read a
--- request-scoped setting independent of which role executes the view) is
--- what actually restricts the result to council or the caller's own row.
--- password_hash is simply never in this view's column list, so it can't
--- leak through even though the owner bypasses RLS.
-create or replace view residents_public as
-  select id, full_name, address, city, postal_code, riding, jurisdiction,
-         role, verification_status, verification_method,
-         submitted_at, verified_at, verified_by, created_at
-  from residents
-  where is_council() or id = current_resident_id();
-grant select on residents_public to authenticated;
-
 -- Normalizes free-text the same way the old client-side normalizeText()
 -- did — trims, collapses whitespace, lowercases — so sign-in stays
 -- forgiving about spacing/case in name and address.
 create or replace function normalize_text(s text) returns text
 language sql immutable as $$
   select lower(regexp_replace(trim(coalesce(s,'')), '\s+', ' ', 'g'))
-$$;
-
--- Mints this app's session token: a JWT signed with the project's real
--- JWT secret (see the one-time setup note at the top of this file) so
--- PostgREST accepts it exactly like a normal Supabase session token.
--- 12-hour expiry: matches the app's "re-verify identity every sign-in"
--- design intent — a resident is expected to sign back in periodically,
--- not stay silently logged in indefinitely.
-create or replace function mint_session_token(p_resident_id text, p_role text) returns text
-language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
-declare
-  v_secret text := (select jwt_secret from app_config where id = true);
-begin
-  if v_secret is null or v_secret = '' then
-    raise exception 'app_config.jwt_secret is not configured — see the setup note at the top of 0001_init.sql';
-  end if;
-  return sign(
-    json_build_object(
-      'role', 'authenticated',
-      'resident_id', p_resident_id,
-      'resident_role', p_role,
-      'iat', extract(epoch from now())::int,
-      'exp', extract(epoch from now() + interval '12 hours')::int
-    ),
-    v_secret,
-    'HS256'
-  );
-end;
 $$;
 
 -- ---------------------------------------------------------------------
@@ -300,8 +248,9 @@ create or replace function sign_up(
 language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
   v_is_council boolean := (p_council_code is not null and p_council_code = (select council_code from app_config where id = true));
-  v_id text;
   v_row residents;
+  v_token uuid;
+  v_expires_at timestamptz := now() + interval '12 hours';
 begin
   if p_password is null or length(p_password) < 6 then
     raise exception 'Password must be at least 6 characters.' using errcode = '22023';
@@ -329,8 +278,11 @@ begin
           case when v_is_council then 'council-onboarding' else null end)
   returning * into v_row;
 
+  insert into sessions (resident_id, expires_at) values (v_row.id, v_expires_at) returning token into v_token;
+
   return jsonb_build_object(
-    'token', mint_session_token(v_row.id, v_row.role),
+    'token', v_token,
+    'expires_at', v_expires_at,
     'resident', to_jsonb(v_row) - 'password_hash'
   );
 end;
@@ -339,9 +291,9 @@ grant execute on function sign_up(text,text,text,text,text,text,text) to anon, a
 
 -- ---------------------------------------------------------------------
 -- sign_in — same fields as the client's doSignIn(): full name + address +
--- ward + password, no username. Unlike the prototype, the match happens
--- entirely server-side so the client never receives the roster or any
--- password hash to scan through.
+-- ward + password, no username. The match happens entirely server-side so
+-- the client never receives the roster or any password hash to scan
+-- through.
 -- ---------------------------------------------------------------------
 create or replace function sign_in(
   p_full_name text, p_address text, p_riding text, p_password text
@@ -349,6 +301,8 @@ create or replace function sign_in(
 language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
   v_row residents;
+  v_token uuid;
+  v_expires_at timestamptz := now() + interval '12 hours';
 begin
   select * into v_row
   from residents
@@ -362,31 +316,57 @@ begin
     raise exception 'Those details don''t match an account.' using errcode = '28000';
   end if;
 
+  insert into sessions (resident_id, expires_at) values (v_row.id, v_expires_at) returning token into v_token;
+
   return jsonb_build_object(
-    'token', mint_session_token(v_row.id, v_row.role),
+    'token', v_token,
+    'expires_at', v_expires_at,
     'resident', to_jsonb(v_row) - 'password_hash'
   );
 end;
 $$;
 grant execute on function sign_in(text,text,text,text) to anon, authenticated;
 
--- Restores a session after a page reload: called with the still-valid JWT
--- attached as the request's bearer token (see SPEC.md "Session restore").
--- Returns the caller's own row, or nothing if the token is missing/expired
--- (client falls back to the sign-in screen either way, matching current
--- behavior when a stored session doesn't resolve to a real resident).
-create or replace function get_my_profile() returns jsonb
+-- Ends a session server-side (so a copied/leaked token can't be replayed
+-- after "sign out") — the old JWT-based draft had no equivalent, since a
+-- JWT can't be revoked without extra machinery; a session table can just
+-- delete the row.
+create or replace function sign_out(p_session_token uuid) returns void
+language sql security definer set search_path = pg_catalog, public, extensions as $$
+  delete from sessions where token = p_session_token
+$$;
+grant execute on function sign_out(uuid) to anon, authenticated;
+
+-- Restores a session after a page reload: called with the still-valid
+-- session token saved locally (see SPEC.md "Session restore"). Returns
+-- the caller's own row, or null if the token is missing/expired (client
+-- falls back to the sign-in screen either way, matching current behavior
+-- when a stored session doesn't resolve to a real resident).
+create or replace function get_my_profile(p_session_token uuid) returns jsonb
 language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
-  v_row residents;
+  v_row residents := session_resident(p_session_token);
 begin
-  if current_resident_id() is null then return null; end if;
-  select * into v_row from residents where id = current_resident_id();
-  if not found then return null; end if;
+  if v_row.id is null then return null; end if;
   return to_jsonb(v_row) - 'password_hash';
 end;
 $$;
-grant execute on function get_my_profile() to authenticated;
+grant execute on function get_my_profile(uuid) to anon, authenticated;
+
+-- Council-only roster, minus password_hash. Replaces the old
+-- residents_public VIEW, which relied on reading role/id off a verified
+-- JWT — there's no such thing to read anymore, so this takes the session
+-- token directly and does the same is-caller-council-or-self check
+-- in-line.
+create or replace function residents_roster(p_session_token uuid) returns setof jsonb
+language sql stable security definer set search_path = pg_catalog, public, extensions as $$
+  with caller as (select session_resident(p_session_token) as c)
+  select to_jsonb(r) - 'password_hash'
+  from residents r, caller
+  where (caller.c).id is not null
+    and ((caller.c).role = 'council' or r.id = (caller.c).id)
+$$;
+grant execute on function residents_roster(uuid) to anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- complete_self_verification — the resident-facing side of the
@@ -400,12 +380,13 @@ grant execute on function get_my_profile() to authenticated;
 -- See SPEC.md "Before this decides a real vote" for why this whole flow
 -- should eventually be replaced with a real identity-verification vendor.
 -- ---------------------------------------------------------------------
-create or replace function complete_self_verification() returns jsonb
+create or replace function complete_self_verification(p_session_token uuid) returns jsonb
 language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
+  v_caller residents := session_resident(p_session_token);
   v_row residents;
 begin
-  if current_resident_id() is null then
+  if v_caller.id is null then
     raise exception 'Not signed in.' using errcode = '28000';
   end if;
   update residents
@@ -413,21 +394,22 @@ begin
       verified_at = now(),
       verified_by = 'automated-demo-check',
       verification_method = 'simulated-id-scan+biometric'
-  where id = current_resident_id()
+  where id = v_caller.id
   returning * into v_row;
   return to_jsonb(v_row) - 'password_hash';
 end;
 $$;
-grant execute on function complete_self_verification() to authenticated;
+grant execute on function complete_self_verification(uuid) to anon, authenticated;
 
 -- Council reviewing a pending application (or revoking one) — mirrors
 -- councilSetVerification() in the client.
-create or replace function council_set_verification(p_resident_id text, p_status text) returns jsonb
+create or replace function council_set_verification(p_session_token uuid, p_resident_id text, p_status text) returns jsonb
 language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
+  v_caller residents := session_resident(p_session_token);
   v_row residents;
 begin
-  if not is_council() then
+  if v_caller.id is null or v_caller.role <> 'council' then
     raise exception 'Council access required.' using errcode = '42501';
   end if;
   if p_status not in ('verified','rejected') then
@@ -436,14 +418,65 @@ begin
   update residents
   set verification_status = p_status,
       verified_at = now(),
-      verified_by = current_resident_id() || ' (council review)'
+      verified_by = v_caller.id || ' (council review)'
   where id = p_resident_id
   returning * into v_row;
   if not found then raise exception 'No such resident.' using errcode = '22023'; end if;
   return to_jsonb(v_row) - 'password_hash';
 end;
 $$;
-grant execute on function council_set_verification(text,text) to authenticated;
+grant execute on function council_set_verification(uuid,text,text) to anon, authenticated;
+
+-- ---------------------------------------------------------------------
+-- create_poll / set_poll_status — council-only poll management. These
+-- replace direct `sb.from('polls').insert(...)/.update(...)` calls from
+-- the old JWT-based draft (which relied on an is_council() RLS policy) —
+-- with no verified role to check in RLS any more, `polls` has no
+-- insert/update policy at all (see above), so these two SECURITY DEFINER
+-- functions are now the only way to create or change a poll.
+-- ---------------------------------------------------------------------
+create or replace function create_poll(
+  p_session_token uuid, p_title text, p_description text, p_category text,
+  p_budget_amount numeric, p_options jsonb, p_eligible_ridings text[], p_closes_at timestamptz
+) returns jsonb
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
+declare
+  v_caller residents := session_resident(p_session_token);
+  v_row polls;
+begin
+  if v_caller.id is null or v_caller.role <> 'council' then
+    raise exception 'Council access required.' using errcode = '42501';
+  end if;
+  insert into polls (title, description, category, budget_amount, options, eligible_ridings, closes_at, created_by)
+  values (p_title, p_description, coalesce(nullif(p_category,''),'General'), coalesce(p_budget_amount,0),
+          p_options, p_eligible_ridings, p_closes_at, v_caller.id)
+  returning * into v_row;
+  return to_jsonb(v_row);
+end;
+$$;
+grant execute on function create_poll(uuid,text,text,text,numeric,jsonb,text[],timestamptz) to anon, authenticated;
+
+create or replace function set_poll_status(p_session_token uuid, p_poll_id uuid, p_status text) returns jsonb
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
+declare
+  v_caller residents := session_resident(p_session_token);
+  v_row polls;
+begin
+  if v_caller.id is null or v_caller.role <> 'council' then
+    raise exception 'Council access required.' using errcode = '42501';
+  end if;
+  if p_status not in ('open','closed') then
+    raise exception 'Invalid status.' using errcode = '22023';
+  end if;
+  update polls
+  set status = p_status, closed_at = case when p_status = 'closed' then now() else null end
+  where id = p_poll_id
+  returning * into v_row;
+  if not found then raise exception 'No such vote.' using errcode = '22023'; end if;
+  return to_jsonb(v_row);
+end;
+$$;
+grant execute on function set_poll_status(uuid,uuid,text) to anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- cast_vote — atomic version of the client's castVote(): one round trip
@@ -452,13 +485,13 @@ grant execute on function council_set_verification(text,text) to authenticated;
 -- closes a real race condition the prototype's client-side
 -- check-then-write pattern had (two tabs/devices racing the same vote).
 -- ---------------------------------------------------------------------
-create or replace function cast_vote(p_poll_id uuid, p_option_id text) returns void
+create or replace function cast_vote(p_session_token uuid, p_poll_id uuid, p_option_id text) returns void
 language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
+  v_caller residents := session_resident(p_session_token);
   v_poll polls;
-  v_resident_id text := current_resident_id();
 begin
-  if v_resident_id is null then
+  if v_caller.id is null then
     raise exception 'Not signed in.' using errcode = '28000';
   end if;
 
@@ -468,17 +501,14 @@ begin
     raise exception 'This vote is closed.' using errcode = '22023';
   end if;
   if v_poll.eligible_ridings is not null and array_length(v_poll.eligible_ridings, 1) > 0 then
-    if not exists (
-      select 1 from residents where id = v_resident_id and riding = any(v_poll.eligible_ridings)
-    ) then
+    if not (v_caller.riding = any(v_poll.eligible_ridings)) then
       raise exception 'This vote is not open to your ward.' using errcode = '42501';
     end if;
   end if;
-  if not exists (select 1 from residents where id = v_resident_id and verification_status = 'verified') then
+  if v_caller.verification_status <> 'verified' then
     raise exception 'Verify your residency before voting.' using errcode = '42501';
   end if;
-  if not (v_poll.options @> jsonb_build_array(jsonb_build_object('id', p_option_id))
-          or exists (select 1 from jsonb_array_elements(v_poll.options) o where o->>'id' = p_option_id)) then
+  if not exists (select 1 from jsonb_array_elements(v_poll.options) o where o->>'id' = p_option_id) then
     raise exception 'Not a valid option for this vote.' using errcode = '22023';
   end if;
 
@@ -486,7 +516,7 @@ begin
   -- blocks a double vote atomically — this insert is the real guard,
   -- not just the pre-check above.
   begin
-    insert into poll_voters (poll_id, resident_id) values (p_poll_id, v_resident_id);
+    insert into poll_voters (poll_id, resident_id) values (p_poll_id, v_caller.id);
   exception when unique_violation then
     raise exception 'You already voted on this item.' using errcode = '23505';
   end;
@@ -494,31 +524,38 @@ begin
   insert into poll_ballots (poll_id, option_id) values (p_poll_id, p_option_id);
 end;
 $$;
-grant execute on function cast_vote(uuid,text) to authenticated;
+grant execute on function cast_vote(uuid,uuid,text) to anon, authenticated;
 
 -- Replaces the client's old per-poll loop of
 -- votersColl(pollId).doc(residentId).get() calls with one query — returns
 -- just the set of poll ids the caller has voted in. The client still
 -- keeps its own note of WHICH option it chose (see SPEC.md — that stays
 -- client-local, same as before, because the server never learns it).
-create or replace function my_voted_polls() returns setof uuid
+create or replace function my_voted_polls(p_session_token uuid) returns setof uuid
 language sql security definer stable set search_path = pg_catalog, public, extensions as $$
-  select poll_id from poll_voters where resident_id = current_resident_id()
+  select poll_id from poll_voters where resident_id = (session_resident(p_session_token)).id
 $$;
-grant execute on function my_voted_polls() to authenticated;
+grant execute on function my_voted_polls(uuid) to anon, authenticated;
 
 -- Aggregate results only — never exposes individual ballot rows, even
 -- though those rows carry no resident reference to begin with. Mirrors
--- computeResults() in the client.
-create or replace function poll_results(p_poll_id uuid) returns jsonb
+-- computeResults() in the client. Requires a valid session (any
+-- signed-in resident, not just council) — matches the old "must be
+-- authenticated" intent from the JWT-based draft.
+create or replace function poll_results(p_session_token uuid, p_poll_id uuid) returns jsonb
 language plpgsql security definer stable set search_path = pg_catalog, public, extensions as $$
 declare
+  v_caller residents := session_resident(p_session_token);
   v_poll polls;
   v_counts jsonb := '{}'::jsonb;
   v_total int;
   v_eligible int;
   r record;
 begin
+  if v_caller.id is null then
+    raise exception 'Not signed in.' using errcode = '28000';
+  end if;
+
   select * into v_poll from polls where id = p_poll_id;
   if not found then raise exception 'No such poll.' using errcode = '22023'; end if;
 
@@ -543,19 +580,18 @@ begin
   return jsonb_build_object('counts', v_counts, 'total', v_total, 'eligible', greatest(v_eligible, v_total));
 end;
 $$;
-grant execute on function poll_results(uuid) to authenticated;
+grant execute on function poll_results(uuid,uuid) to anon, authenticated;
 
 -- =====================================================================
 -- SECURITY NOTES for whoever (Claude Code) picks this up
 -- =====================================================================
--- 1. Passwords are now bcrypt-hashed (pgcrypto) and never leave the
---    database — the old prototype's client-side "fetch every resident,
---    scan for a match" pattern is gone. Sign-in/sign-up are the ONLY
---    entry points that touch residents' password_hash, and both are
---    SECURITY DEFINER functions with narrowly-scoped grants.
+-- 1. Passwords are bcrypt-hashed (pgcrypto) and never leave the database
+--    — sign-in/sign-up are the ONLY entry points that touch residents'
+--    password_hash, and both are SECURITY DEFINER functions with
+--    narrowly-scoped grants.
 -- 2. `residents` has RLS enabled with NO policies for anon/authenticated
 --    — direct table access is fully denied. Every legitimate read/write
---    goes through a function above, or residents_public (roster view).
+--    goes through a function above.
 -- 3. `poll_voters` / `poll_ballots` also have RLS enabled with no direct
 --    policies — the secret-ballot guarantee (nothing links a resident to
 --    a choice) is enforced at the schema level, not just by convention.
@@ -569,4 +605,18 @@ grant execute on function poll_results(uuid) to authenticated;
 --    the poll, and the (poll_id, resident_id) primary key as the real
 --    double-vote guard) — this closes a race condition the original
 --    client-side check-then-write pattern had.
+-- 6. Sessions are plain rows in `sessions`, not JWTs — see the auth-model
+--    note at the top of this file for why. `sign_out()` actually deletes
+--    the row, so a leaked/copied token stops working the moment the
+--    owner signs out, unlike a JWT (which stays valid until it expires,
+--    full stop). `sessions` itself has RLS enabled with no policies —
+--    only session_resident() (SECURITY DEFINER) ever reads it.
+-- 7. Every SECURITY DEFINER function above pins `search_path` and every
+--    request runs as the `anon` Postgres role (there's no JWT to elevate
+--    to `authenticated` any more) — this is deliberate: Postgres always
+--    searches a session's own temp schema first for relation names
+--    regardless of search_path, for any role, so `revoke temporary` near
+--    the top of this file is what actually closes that hole, not the
+--    search_path pins alone (see the comment there for the confirmed
+--    exploit this fixes).
 -- =====================================================================

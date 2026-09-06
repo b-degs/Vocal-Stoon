@@ -366,45 +366,30 @@
      localStorage-backed local-store fallback the standalone export used —
      there's exactly one real backend now, used the same way regardless of
      how someone reaches this page (hosted link, downloaded file, whatever).
-     See ../SPEC.md "Auth model" for why sign-in mints its own JWT instead
-     of using Supabase's built-in email/password auth.
+     See ../SPEC.md "Auth model" for why this doesn't use Supabase's
+     built-in email/password auth, and its "session table" note for why
+     there's no JWT here at all — every RPC that needs to know who's
+     calling takes the session token as a plain parameter instead of an
+     Authorization header, so there's exactly one client instance, created
+     once, never recreated on sign in/out.
   --------------------------------------------------------------------- */
-  var AUTH_TOKEN_KEY = 'vocalstoon_auth_token_v1';
-  function saveAuthToken(t){ try{ localStorage.setItem(AUTH_TOKEN_KEY, t); }catch(e){} }
-  function readAuthToken(){ try{ return localStorage.getItem(AUTH_TOKEN_KEY); }catch(e){ return null; } }
-  function clearAuthToken(){ try{ localStorage.removeItem(AUTH_TOKEN_KEY); }catch(e){} }
+  var sb = supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
 
-  // A JWT's payload is the base64url part between the two dots — no
-  // signature verification here (the server verifies it on every request
-  // that matters); this is only used client-side to decide whether it's
-  // even worth trying a token before asking the user to sign in again.
-  function decodeJwtPayload(token){
-    try{
-      var b64 = token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
-      return JSON.parse(decodeURIComponent(atob(b64).split('').map(function(c){
-        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-      }).join('')));
-    }catch(e){ return null; }
+  var SESSION_KEY = 'vocalstoon_session_v1';
+  var CURRENT_TOKEN = null;   // the session token to attach to every RPC call that needs identity
+  function saveSession(token, expiresAt){ try{ localStorage.setItem(SESSION_KEY, JSON.stringify({ token: token, expiresAt: expiresAt })); }catch(e){} }
+  function readSession(){ try{ return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); }catch(e){ return null; } }
+  function clearSession(){ try{ localStorage.removeItem(SESSION_KEY); }catch(e){} }
+  function sessionLooksValid(s){ return !!(s && s.token && s.expiresAt && new Date(s.expiresAt).getTime() > Date.now()); }
+  function setSession(token, expiresAt){
+    CURRENT_TOKEN = token || null;
+    if(token){ saveSession(token, expiresAt); } else { clearSession(); }
   }
-  function tokenLooksValid(token){
-    var payload = token && decodeJwtPayload(token);
-    return !!(payload && payload.exp && payload.exp * 1000 > Date.now());
-  }
-
-  // Recreated whenever the auth token changes (sign in/out) since
-  // supabase-js doesn't expose a way to swap the Authorization header on
-  // an existing client instance.
-  var sb = null;
-  function makeSupabaseClient(token){
-    return supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
-      auth: { persistSession: false, autoRefreshToken: false },
-      global: token ? { headers: { Authorization: 'Bearer ' + token } } : {}
-    });
-  }
-  function setAuthToken(token){
-    if(token){ saveAuthToken(token); } else { clearAuthToken(); }
-    sb = makeSupabaseClient(token);
-  }
+  // Merges the current session token into an RPC's params — every
+  // identity-checking function in 0001_init.sql takes p_session_token.
+  function withToken(params){ return Object.assign({ p_session_token: CURRENT_TOKEN }, params || {}); }
 
   // Turns a PostgREST/RPC error (see the `raise exception ... using
   // errcode` calls in 0001_init.sql) into the same user-facing wording the
@@ -447,9 +432,10 @@
   function clearSubs(){ S.unsubs.forEach(function(u){ try{u();}catch(e){} }); S.unsubs = []; }
 
   /* ---------------------------------------------------------------------
-     Persistence helpers — session identity now lives in the real JWT
-     (see setAuthToken above), minted server-side by sign_in()/sign_up()
-     in 0001_init.sql. A resident's password never touches this file.
+     Persistence helpers — session identity now lives in the session
+     token (see setSession above), issued server-side by sign_in()/
+     sign_up() in 0001_init.sql. A resident's password never touches this
+     file.
   --------------------------------------------------------------------- */
 
   // Remembered separately from the active session so that, even after
@@ -555,7 +541,7 @@
   function subscribeResidents(){ return refreshResidents(); }
   function refreshResidents(){
     if(!S.currentUser || S.currentUser.role !== 'council') return Promise.resolve();
-    return sb.from('residents_public').select('*').then(function(res){
+    return sb.rpc('residents_roster', withToken()).then(function(res){
       if(res.error){ toast('Resident list disconnected: ' + rpcErrorMessage(res.error, 'try reloading the page.')); return; }
       S.residents = (res.data || []).map(rowToResident);
       render();
@@ -571,7 +557,7 @@
   function refreshMyBallots(){
     if(!S.currentUser) return Promise.resolve();
     var mine = loadMyVotes();
-    return sb.rpc('my_voted_polls').then(function(res){
+    return sb.rpc('my_voted_polls', withToken()).then(function(res){
       if(res.error) return;
       var votedIds = res.data || [];
       var next = {};
@@ -581,7 +567,7 @@
   }
 
   function computeResults(pollId){
-    return sb.rpc('poll_results', { p_poll_id: pollId }).then(function(res){
+    return sb.rpc('poll_results', withToken({ p_poll_id: pollId })).then(function(res){
       if(res.error){ toast('Could not load results: ' + rpcErrorMessage(res.error, 'please try again.')); return; }
       var r = res.data || {};
       S.pollResults[pollId] = { counts: r.counts || {}, total: r.total || 0, eligible: r.eligible || 0 };
@@ -608,7 +594,7 @@
       S.authBusy = false;
       if(res.error){ S.authError = rpcErrorMessage(res.error, 'Those details don\'t match an account.'); return render(); }
       var payload = res.data;
-      setAuthToken(payload.token);
+      setSession(payload.token, payload.expires_at);
       S.currentUser = rowToResident(payload.resident);
       S.authError = ''; rememberLastIdentity(S.currentUser);
       afterLogin();
@@ -636,7 +622,7 @@
       S.authBusy = false;
       if(res.error){ S.authError = rpcErrorMessage(res.error, 'Could not create your account.'); return render(); }
       var payload = res.data;
-      setAuthToken(payload.token);
+      setSession(payload.token, payload.expires_at);
       var doc = rowToResident(payload.resident);
       S.currentUser = doc; S.authError = '';
       rememberLastIdentity(doc);
@@ -687,7 +673,12 @@
 
   function doSignOut(){
     clearSubs();
-    setAuthToken(null);
+    // Best-effort — actually deletes the session row server-side so a
+    // copied/leaked token can't be replayed after this point, unlike a
+    // JWT (which would stay valid until it expired regardless). Don't
+    // block the UI on it either way; the local token is cleared next.
+    if(CURRENT_TOKEN) sb.rpc('sign_out', withToken()).catch(function(){});
+    setSession(null);
     S = Object.assign({}, S, { currentUser:null, view:'login', authTab:'signin', authError:'', polls:[], residents:[], myBallots:{}, pollResults:{}, notifications:[], notifOpen:false });
     render();
   }
@@ -718,7 +709,7 @@
         // client-side update could have been. See SPEC.md "Before this
         // decides a real vote" for why the simulation itself should
         // eventually be replaced with a real ID-verification provider.
-        sb.rpc('complete_self_verification').then(function(res){
+        sb.rpc('complete_self_verification', withToken()).then(function(res){
           if(res.error){
             S.verifyStep = 0;
             toast('Verification could not be saved: ' + rpcErrorMessage(res.error, 'please try again.'));
@@ -736,7 +727,7 @@
   }
 
   function councilSetVerification(residentId, status){
-    sb.rpc('council_set_verification', { p_resident_id: residentId, p_status: status }).then(function(res){
+    sb.rpc('council_set_verification', withToken({ p_resident_id: residentId, p_status: status })).then(function(res){
       if(res.error){ toast('Could not update this application: ' + rpcErrorMessage(res.error, 'please try again.')); return; }
       toast(status === 'verified' ? 'Resident approved.' : 'Resident application rejected.');
       refreshResidents();
@@ -757,7 +748,7 @@
     var poll = S.polls.filter(function(p){ return p.id===pollId; })[0];
     if(poll && !pollVisibleToResident(poll, S.currentUser)){ toast('This vote is not open to your ward.'); S.view='resident'; return render(); }
     S.voteBusy = true; render();
-    sb.rpc('cast_vote', { p_poll_id: pollId, p_option_id: optionId }).then(function(res){
+    sb.rpc('cast_vote', withToken({ p_poll_id: pollId, p_option_id: optionId })).then(function(res){
       S.voteBusy = false;
       if(res.error){
         var msg = rpcErrorMessage(res.error, 'Your vote could not be recorded.');
@@ -788,14 +779,17 @@
     var ridings = (fields.ridings || []).filter(function(w){ return RIDINGS.indexOf(w) !== -1; });
     if(fields.ridingScope === 'specific' && ridings.length === 0){ toast('Select at least one ward, or switch back to all of ' + MUNICIPALITY + '.'); return; }
     var options = opts.slice(0,6).map(function(label){ return { id: uid(), label: label }; });
-    var row = {
-      title: fields.title, description: fields.description, category: fields.category || 'General',
-      budget_amount: Number(fields.budgetAmount) || 0, options: options,
-      eligible_ridings: fields.ridingScope === 'specific' ? ridings : null,
-      closes_at: new Date(fields.closesAt).toISOString(), status: 'open',
-      created_by: S.currentUser.id
-    };
-    sb.from('polls').insert(row).then(function(res){
+    // A plain sb.from('polls').insert(...) can't be authorized any more —
+    // there's no JWT-verified role for an is_council() RLS policy to check
+    // (see SPEC.md's auth-model note) — so this goes through the
+    // create_poll() RPC instead, which checks the caller's session token
+    // itself and is the only way to write a poll now.
+    sb.rpc('create_poll', withToken({
+      p_title: fields.title, p_description: fields.description, p_category: fields.category || 'General',
+      p_budget_amount: Number(fields.budgetAmount) || 0, p_options: options,
+      p_eligible_ridings: fields.ridingScope === 'specific' ? ridings : null,
+      p_closes_at: new Date(fields.closesAt).toISOString()
+    })).then(function(res){
       if(res.error){ toast('Could not publish this vote: ' + rpcErrorMessage(res.error, 'please try again.')); return; }
       toast('Vote published — residents will see it now.');
       S.newPollOptions = ['','']; S.councilTab = 'manage';
@@ -807,7 +801,7 @@
   }
 
   function closePoll(pollId){
-    sb.from('polls').update({ status:'closed', closed_at: new Date().toISOString() }).eq('id', pollId).then(function(res){
+    sb.rpc('set_poll_status', withToken({ p_poll_id: pollId, p_status: 'closed' })).then(function(res){
       if(res.error){ toast('Could not close voting: ' + rpcErrorMessage(res.error, 'please try again.')); return; }
       toast('Voting closed.');
       refetchPolls().then(function(){ computeResults(pollId); });
@@ -815,7 +809,7 @@
   }
 
   function reopenPoll(pollId){
-    sb.from('polls').update({ status:'open', closed_at: null }).eq('id', pollId).then(function(res){
+    sb.rpc('set_poll_status', withToken({ p_poll_id: pollId, p_status: 'open' })).then(function(res){
       if(res.error){ toast('Could not reopen this vote: ' + rpcErrorMessage(res.error, 'please try again.')); return; }
       toast('Vote reopened.');
       refetchPolls();
@@ -1411,26 +1405,24 @@
 
   /* ---------------------------------------------------------------------
      Boot
-     Session restore now means: is there a still-valid JWT saved locally?
-     If so, hand it straight to get_my_profile() (0001_init.sql) to fetch
-     the resident's own row — no password re-entry needed. An expired or
-     missing token just lands on the sign-in screen, which fits the app's
-     existing "re-verify identity every sign-in" design intent anyway.
+     Session restore now means: is there a still-valid session token saved
+     locally? If so, hand it straight to get_my_profile() (0001_init.sql)
+     to fetch the resident's own row — no password re-entry needed. An
+     expired or missing token just lands on the sign-in screen, which fits
+     the app's existing "re-verify identity every sign-in" design intent
+     anyway.
   --------------------------------------------------------------------- */
   function boot(){
-    // Read the stored token FIRST — every branch below eventually calls
-    // setAuthToken(), which overwrites/clears that same storage key, so
-    // grabbing it up front avoids reading back what we just wrote.
-    var savedToken = readAuthToken();
-    if(savedToken && tokenLooksValid(savedToken)){
-      setAuthToken(savedToken);
-      sb.rpc('get_my_profile').then(function(res){
-        if(res.error || !res.data){ setAuthToken(null); render(); return; }
+    var saved = readSession();
+    if(sessionLooksValid(saved)){
+      setSession(saved.token, saved.expiresAt);
+      sb.rpc('get_my_profile', withToken()).then(function(res){
+        if(res.error || !res.data){ setSession(null); render(); return; }
         S.currentUser = rowToResident(res.data);
         afterLogin();
-      }).catch(function(){ setAuthToken(null); render(); });
+      }).catch(function(){ setSession(null); render(); });
     } else {
-      setAuthToken(null); // anon client, and clears any leftover expired token
+      setSession(null); // clears any leftover expired session
       render();
     }
   }

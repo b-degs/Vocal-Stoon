@@ -24,27 +24,39 @@ turnout and results.
 
 ## Status
 
-The migration and frontend in this repo have been checked against a local
-Postgres instance (schema, RLS policies, and every RPC function exercised
-directly — sign-up, sign-in, casting a vote, double-vote prevention, ward
-eligibility, council roster access, and the secret-ballot lockdown). Two real
-bugs turned up in that pass and are already fixed in the committed migration:
-a function-ordering issue that broke `polls`' Row Level Security entirely,
-and a `residents_public` view that always returned zero rows. A third,
-more serious issue — any client could shadow `residents` (or any other
-table) with a same-named temp table and trick the sign-in/sign-up/vote
-functions into operating on forged data, including minting themselves a
-valid council session token — is also fixed (`REVOKE TEMPORARY` in the
-migration; see the comment above it for why `search_path` alone doesn't
-close this).
+This has been through two rounds of testing and one architecture change.
+An earlier draft minted its own JWTs for sessions (a real Supabase "bring
+your own auth" pattern) — that was built, tested against a local Postgres
+instance (catching and fixing a function-ordering bug that broke `polls`'
+RLS entirely, a roster view that always returned zero rows, and a
+confirmed privilege-escalation exploit via temp-table shadowing, fixed
+with `REVOKE TEMPORARY`), and then found not to work at all against a
+real Supabase project: that project's only signing key is asymmetric
+(ES256), and a JWT signed with a plain shared secret can never verify
+there — confirmed directly against the project's own JWKS endpoint, not
+a guess.
 
-Still needed before this goes live, because nothing here has touched a real
-Supabase project: run the migration there, do the one-time JWT-secret and
-council-code setup (`SPEC.md` step 4), fill in the two config values in
-`frontend/vocal-stoon.html`, and walk through the manual checklist in
-`SPEC.md`'s "What's unverified" section — in particular confirming Supabase
-Realtime behaves as expected and that your project's JWT configuration
-matches the shared-secret (HS256) approach this migration assumes.
+So the auth model changed: sessions are now plain rows in a `sessions`
+table instead of JWTs, and every RPC that needs to know who's calling
+takes the session token as an explicit parameter rather than relying on
+Supabase's JWT/RLS layer at all. This works regardless of what signing
+keys a given Supabase project uses. Re-verified end-to-end against a local
+Postgres instance after the redesign — sign-up/sign-in, the council-code
+gate, ward eligibility, verified-only voting, double-vote rejection,
+council-only roster access, poll create/close/reopen, results aggregation,
+session sign-out actually revoking access, and the secret-ballot/temp-table
+lockdowns all confirmed working. See `SPEC.md`'s "Auth model" and "What's
+been verified" sections for the full detail.
+
+Still needed before this goes live: the actual round trip through
+`supabase-js` from a real browser against your live project hasn't been
+exercised (everything above was verified by calling the database directly
+as the `anon` role, which is what the real API layer also does now — but
+the literal HTTP path hasn't been). Fill in the two config values in
+`frontend/vocal-stoon.html` (Project URL + publishable key), set your
+council code (`SPEC.md` step 4), and walk through `SPEC.md`'s "What's been
+verified" checklist — in particular confirming Supabase Realtime behaves
+as expected on `polls`.
 
 ## Where this came from
 

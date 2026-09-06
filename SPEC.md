@@ -43,27 +43,20 @@ what its comment says before this goes anywhere near real residents' data.
    touching production data).
 2. Run `supabase/migrations/0001_init.sql` against it.
 3. In the Supabase dashboard: **Settings → API**. Copy the project URL and
-   anon public key into `frontend/vocal-stoon.html`'s two `window.SUPABASE_*`
-   placeholders near the top of the file.
-4. Copy the **JWT Secret** from that same settings page and run, once,
-   against your database:
+   publishable (anon) key into `frontend/vocal-stoon.html`'s two
+   `window.SUPABASE_*` placeholders near the top of the file.
+4. Set a real council signup code (replaces the hardcoded demo
+   "STOON-COUNCIL" constant the old client-side-only version used):
    ```sql
-   ALTER DATABASE postgres SET app.jwt_secret = '<paste it>';
-   ALTER DATABASE postgres SET app.council_code = '<pick a real council signup code>';
+   update app_config set council_code = '<pick a real council signup code>' where id = true;
    ```
-   Reconnect (or open a fresh connection) afterward so the setting takes.
-5. **Auth caveat:** this only works if your project uses the classic
-   shared-secret (HS256) JWT setup. Some newer Supabase projects default to
-   asymmetric signing keys instead, in which case `pgjwt`'s `sign()` with a
-   plain secret won't produce a token PostgREST accepts. If your dashboard
-   doesn't show a plain "JWT Secret" string, check Supabase's docs for
-   switching that project back to the legacy shared-secret mode, or adapt
-   the signing in `mint_session_token()` to whatever your project's current
-   JWT configuration requires.
-6. Deploy `frontend/vocal-stoon.html` as a static file anywhere (GitHub
+5. Deploy `frontend/vocal-stoon.html` as a static file anywhere (GitHub
    Pages, Netlify, Vercel, S3+CloudFront, whatever) — it's still a single
    self-contained HTML file with one external script tag (supabase-js from
    a CDN).
+
+There is deliberately no JWT-secret step here any more — see "Auth model"
+below for why.
 
 ## Auth model — why it's built this way
 
@@ -73,22 +66,51 @@ screen's own copy: "there's no username to choose"), not something to
 change. But it means Supabase's built-in email/password auth (GoTrue)
 doesn't fit — GoTrue needs an email or phone number as the identifier.
 
-So this build mints its **own** session tokens: `sign_in()` and `sign_up()`
-(both in `0001_init.sql`) are Postgres functions that do the name+address+
-ward+password matching themselves (server-side, so the client never sees
-the roster or a password hash), then sign a JWT with the project's real JWT
-secret via the `pgjwt` extension. That JWT is a normal, valid Supabase
-session token as far as PostgREST and Row Level Security are concerned — it
-carries the standard `role: authenticated` claim PostgREST needs, plus two
-custom claims (`resident_id`, `resident_role`) that the RLS policies and
-helper functions (`current_resident_id()`, `is_council()`) read. The client
-just attaches it as a Bearer token on every request afterward (see
-`makeSupabaseClient()` in the frontend).
+**An earlier draft of this build minted its own JWTs** (via the `pgjwt`
+extension) for this — a real, documented "bring your own auth" pattern on
+Supabase. It was built, verified against a local Postgres instance, and
+then found **not to work** against an actual project: PostgREST there
+verifies Bearer tokens against the project's real signing keys (its
+JWKS), and a project can use ES256/RS256 keys with no HS256 entry
+available at all — confirmed directly, by fetching a real project's own
+`/auth/v1/.well-known/jwks.json` and seeing only an `"EC"` key. A plain
+HS256-signed token can never verify there; it's an algorithm mismatch, not
+a config problem, and no amount of secret-wrangling or key-ID-matching
+fixes it. If your dashboard shows only asymmetric signing keys, this isn't
+a "you set something up wrong" situation — it's the actual, unavoidable
+shape of the problem.
 
-This is a documented, legitimate pattern for "bring your own auth" on
-Supabase — but it is NOT the default path, so double check it against
-Supabase's current custom-JWT docs for your project's Postgres version
-before relying on it.
+**So this build uses a plain session table instead** (`sessions` in
+`0001_init.sql`), and never asks PostgREST's JWT/RLS layer to vouch for
+anyone:
+
+- `sign_in()`/`sign_up()` do the name+address+ward+password matching
+  themselves (server-side, so the client never sees the roster or a
+  password hash), then insert a row into `sessions` — just a random
+  token pointing at the resident's id, with a 12-hour expiry — and hand
+  the token back to the client.
+- Every RPC that needs to know who's calling (`cast_vote`,
+  `complete_self_verification`, `council_set_verification`, `create_poll`,
+  `set_poll_status`, `my_voted_polls`, `poll_results`, `get_my_profile`,
+  `residents_roster`) takes that token as an explicit `p_session_token`
+  parameter and resolves it itself via `session_resident()`, instead of
+  reading a verified JWT's claims.
+- The client always calls Supabase with just the plain publishable key —
+  there's no Authorization-header dance, no role switching between `anon`
+  and `authenticated`. Every request runs as `anon`; the actual
+  authorization check happens inside each function, in plain SQL, driven
+  by the session token parameter.
+- `sign_out()` deletes the session row outright, which is actually a step
+  *up* from the JWT approach — a JWT stays valid until it expires no
+  matter what; a deleted session row stops working immediately.
+
+This is less "clever" than minting real JWTs, but it doesn't depend on
+Supabase's signing-key configuration at all — it'll keep working
+regardless of what key type a given project uses, now or after any future
+change on Supabase's end. `polls` had to move from RLS-gated reads/writes
+to: open reads for everyone (see "Minor behavior change" below) and
+writes only through `create_poll()`/`set_poll_status()`, since there's no
+verified role left for an `is_council()` RLS policy to check.
 
 ## Data model
 
@@ -124,8 +146,8 @@ why so you don't accidentally undo them:
    all** for `anon`/`authenticated` — direct reads/writes are fully denied.
    Every legitimate access path is a specific function (`sign_up`,
    `sign_in`, `get_my_profile`, `complete_self_verification`,
-   `council_set_verification`) or the `residents_public` view (roster,
-   council-only, no `password_hash` column).
+   `council_set_verification`, `residents_roster` for the council-only
+   roster, no `password_hash` column).
 3. **Secret ballot, enforced by schema, not convention.** `poll_voters` (did
    this resident vote — no choice attached) and `poll_ballots` (an
    anonymous choice, no resident reference at all) both have RLS enabled
@@ -171,95 +193,86 @@ nothing else in the schema or client has to change.
   force an immediate refetch right after their own write, so the person who
   just made the change sees it instantly instead of waiting on the
   realtime round trip.
-- `residents` is deliberately **NOT** wired up to Realtime. That table
-  holds home addresses and password hashes; whether Supabase's Realtime
-  layer correctly applies a table's RLS per-subscriber (vs. broadcasting
-  full row payloads to anyone connected, a known historical gotcha on some
-  Supabase versions) is something to verify carefully for your specific
-  project before ever turning it on for a sensitive table. The council
-  roster is a plain fetch instead — called once when council opens that
-  tab, and re-called after every approve/reject action so it still feels
-  live. If you confirm Realtime-with-RLS is safe on your project version
-  and want push updates here too, `residents_public` (the roster view) is
-  the thing to subscribe to, never the base `residents` table directly.
+- `residents` is deliberately **NOT** wired up to Realtime, and — since the
+  auth-model change above dropped JWT/RLS-based authorization entirely —
+  now *can't* be, safely: Realtime subscribes to a raw table's changes,
+  with no way to route a session-token check through it the way the RPC
+  functions do. The council roster is a plain fetch instead (via the
+  `residents_roster()` RPC) — called once when council opens that tab, and
+  re-called after every approve/reject action so it still feels live.
 
 ## What's been verified since, and what's still your job
 
-The original version of this section said none of this had touched a real
-Postgres instance. Since then it's been run — not against a live Supabase
-project (no credentials/network path to one exists here either), but
-against a local Postgres 16 with `pgcrypto` and `pgjwt` installed and
-`anon`/`authenticated` roles and default grants set up to mirror a fresh
-Supabase project, driving every RPC directly while manually setting
-`request.jwt.claims` and `SET ROLE` the way PostgREST would per-request.
-That pass found and fixed three real bugs in the migration (see git
-history / SPEC.md's earlier revisions for the exact diffs):
+This migration went through two real rounds of testing, and one full
+architecture change, before landing here:
 
-1. **The migration didn't actually run.** `polls`'s RLS policies referenced
-   `is_council()`/`current_resident_role()`, which were defined *later* in
-   the file. `CREATE POLICY` resolves its expression immediately, so this
-   errored out policy creation — meaning after running the migration
-   top-to-bottom once, `polls` had RLS enabled with **zero** working
-   policies (nobody could read or write any poll, at all). Fixed by moving
-   the JWT helper functions before the `polls` section.
-2. **`residents_public` always returned zero rows.** It was declared
-   `security_invoker = true`, but `residents` has RLS enabled with no
-   policies for anon/authenticated at all — Postgres's RLS default-deny
-   applies before a view's own WHERE clause does, security-invoker or not.
-   So the council roster and the "read my own row" fallback were both
-   silently broken. Fixed by dropping `security_invoker` so the view runs
-   as its owner (exempt from `residents`' RLS, since the table was never
-   given `FORCE ROW LEVEL SECURITY`), while the view's own WHERE clause
-   (checked against the real caller's JWT claims) still does the actual
-   restricting.
-3. **A working privilege-escalation exploit.** None of the `SECURITY
-   DEFINER` functions pinned `search_path`. Postgres always searches a
-   session's own temp schema first for *relation* names, for every role,
-   regardless of search_path — so any signed-in-or-not client could run
-   `create temp table residents (...)` in their own session and have
-   `sign_in()` read that fake table instead of the real one. This was
-   confirmed as a live exploit: a forged `residents` row got `sign_in()` to
-   mint a real, PostgREST-valid **council** session JWT for an account that
-   was never actually signed up. `SET search_path` on the functions doesn't
-   stop this (search_path doesn't affect temp-schema lookup for relations)
-   — the actual fix is the `REVOKE TEMPORARY ... FROM PUBLIC` now near the
-   top of the migration, confirmed to close the hole.
+**Round 1 (local Postgres, JWT-based draft — since replaced).** Driving
+every RPC directly against a local Postgres 16 instance set up to mirror a
+fresh Supabase project, three real bugs surfaced and were fixed: `polls`'s
+RLS policies referenced helper functions defined *later* in the file
+(silently leaving `polls` with zero working policies after the migration
+"succeeded"); the council-roster view always returned zero rows due to a
+`security_invoker`/RLS-default-deny interaction; and a confirmed,
+working privilege-escalation exploit (a client-created temp table could
+shadow `residents` and trick `sign_in()` into minting a forged council
+session), fixed with `REVOKE TEMPORARY ... FROM PUBLIC`.
 
-Also exercised and confirmed correct: sign-up/sign-in (including
-whitespace/case-insensitive name+address matching and bcrypt password
-checks), the council-code gate, ward-scoped poll eligibility, the
-verified-residents-only voting requirement, atomic double-vote rejection,
-`poll_results()` aggregation without ever exposing a raw ballot row (not
-even to council), and that `residents`/`poll_voters`/`poll_ballots` are
-completely unreadable via direct table access for both `anon` and
-`authenticated`.
+**Then, against an actual live Supabase project**, the JWT-minting
+approach itself turned out not to work at all — see "Auth model" above.
+That's what drove the session-table redesign now in this file.
+
+**Round 2 (local Postgres, current session-table design).** Re-verified
+end-to-end after the redesign, calling every RPC as the `anon` role (since
+that's now the only role anything runs as) with real session tokens:
+sign-up/sign-in (including whitespace/case-insensitive name+address
+matching and bcrypt password checks), the council-code gate, `anon`
+direct-table access to `residents`/`sessions`/`poll_ballots` still fully
+denied, `residents_roster()` correctly scoping to self vs. full roster for
+council, ward-scoped poll eligibility, the verified-residents-only voting
+requirement, atomic double-vote rejection, `create_poll()`/
+`set_poll_status()` correctly requiring council and rejecting a resident
+caller, `poll_results()` aggregation without ever exposing a raw ballot
+row, `my_voted_polls()`, and `sign_out()` actually revoking a session (a
+`get_my_profile()` call with a signed-out token correctly returns
+nothing). The temp-table-shadowing exploit fix was re-confirmed against
+this version too.
 
 **Not yet verified — still needs a real Supabase project:**
 
-- The actual PostgREST/GoTrue wiring end-to-end through `supabase-js` from
-  a browser (this was checked at the SQL/RLS layer directly, simulating
-  PostgREST's per-request role and `request.jwt.claims` behavior, not
-  through a live PostgREST instance).
-- The JWT-secret setup (step 4 above) against your specific project's auth
-  configuration — this is the part most likely to need adjustment (see the
-  "Auth caveat" note); local testing used a plain HS256 secret and can't
-  confirm how your project's dashboard exposes (or doesn't expose) one.
-- Supabase Realtime actually applying `polls`' RLS per-subscriber the way
-  the "Realtime" section above assumes.
+- The actual round trip through `supabase-js` from a real browser talking
+  to a live project (this was checked by calling the RPCs directly against
+  Postgres as the `anon` role, which is what the real PostgREST layer also
+  does now that there's no JWT/role-switching involved — but the literal
+  HTTP path through PostgREST hasn't been exercised).
+- Supabase Realtime's behavior on `polls` in practice (the subscription
+  code itself didn't change in this redesign).
 - A true concurrent double-vote race (two simultaneous requests) — the
   primary-key-based guard was confirmed to reject a *second* vote from the
   same resident, which is the same mechanism a true race would hit, but an
   actual two-connections-at-once race wasn't run.
+- Session cleanup: expired rows in `sessions` are simply ignored (never
+  matched by `session_resident()`), not deleted. Fine for a pilot; worth a
+  periodic cleanup job (`delete from sessions where expires_at < now()`)
+  before this scales to many users.
 
-## Minor behavior change (disclosed, not hidden)
+## Minor behavior changes (disclosed, not hidden)
 
-`refreshMyBallots()` (frontend) now reflects **every** poll a resident has
-ever voted on, open or closed, via the new `my_voted_polls()` RPC. The
-original client-side loop only checked currently-*open* polls, so a
-returning resident's History tab could stop correctly showing "You voted:
-X" for a poll that closed since their last visit (the render code already
-supported showing it — the refresh function just never fetched closed-poll
-ballots). This is a small correctness fix, not a feature change.
+- `refreshMyBallots()` (frontend) now reflects **every** poll a resident
+  has ever voted on, open or closed, via the `my_voted_polls()` RPC. The
+  original client-side loop only checked currently-*open* polls, so a
+  returning resident's History tab could stop correctly showing "You
+  voted: X" for a poll that closed since their last visit (the render code
+  already supported showing it — the refresh function just never fetched
+  closed-poll ballots). This is a small correctness fix, not a feature
+  change.
+- Poll listings (`polls`) are now readable by anyone hitting the API,
+  signed in or not — see "Auth model" above for why (there's no verified
+  role left for a "must be signed in" RLS policy to check). Voting, the
+  resident roster, and results all still require a valid session; only
+  the bare list of poll titles/descriptions/budgets is now technically
+  public. Given these are public municipal budget votes, that's a
+  reasonable trade-off, but flagging it since it's a real change from the
+  original prototype's behavior.
 
 ## Feature parity checklist
 
