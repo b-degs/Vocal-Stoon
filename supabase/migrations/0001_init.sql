@@ -7,20 +7,34 @@
 -- prototype (see "SECURITY NOTES" at the bottom of this file).
 --
 -- ONE-TIME MANUAL SETUP after running this migration:
---   1. In the Supabase dashboard: Settings -> API -> copy the "JWT Secret"
---      (legacy shared-secret / HS256 project). If your project only shows
---      new asymmetric signing keys, see SPEC.md "Auth caveat" section.
---   2. Run once, with your real secret substituted in:
---        ALTER DATABASE postgres SET app.jwt_secret = '<paste-your-secret>';
---   3. Reconnect / restart your Postgres connection (or just start a new
---      one) so the setting takes effect for new sessions.
---   4. Set a real council signup code (replaces the hardcoded demo
---      "STOON-COUNCIL" constant in the old client-side code):
---        ALTER DATABASE postgres SET app.council_code = '<pick-a-real-code>';
+--   1. In the Supabase dashboard: Settings -> API -> "JWT Keys" -> copy the
+--      current key's secret. If your project only shows asymmetric signing
+--      keys (ES256/RS256 — no plain secret string anywhere), rotate to a
+--      shared-secret key first: "Create standby key" -> choose HS256 /
+--      "Legacy shared secret" -> promote it to current -> switch to the
+--      "Legacy" view to reveal the actual secret string. See SPEC.md
+--      "Auth caveat" for why this build needs a plain HS256 secret.
+--   2. Run once, with your real values substituted in:
+--        update app_config set jwt_secret = '<paste-your-secret>',
+--                               council_code = '<pick-a-real-code>';
+--      (Older guidance for this kind of setting says
+--      `ALTER DATABASE ... SET app.foo = ...` — as of this build, Supabase
+--      denies that outright on at least some projects, even to the SQL
+--      Editor's own role, on both the database and any role
+--      ("permission denied to set parameter"). The app_config table below
+--      sidesteps that: it only needs the same ordinary table-owner
+--      privilege you already have from running this migration.)
 -- =====================================================================
 
-create extension if not exists pgcrypto;   -- crypt()/gen_salt() password hashing
-create extension if not exists pgjwt;      -- sign() for minting our own session JWTs
+-- Supabase installs pgcrypto (and would install pgjwt) into a schema
+-- called `extensions`, not `public` — confirmed on a real project while
+-- building this. Installing both explicitly into that same schema keeps
+-- pgjwt's internal calls to pgcrypto's hmac()/etc. resolving correctly;
+-- leaving pgjwt to default to `public` (the failure mode this comment is
+-- warning about) breaks it with "function public.hmac(...) does not
+-- exist" the first time sign_up()/sign_in() actually run.
+create extension if not exists pgcrypto with schema extensions;   -- crypt()/gen_salt() password hashing
+create extension if not exists pgjwt with schema extensions;      -- sign() for minting our own session JWTs
 
 -- Every anon/authenticated role can, by default, CREATE TEMP TABLE in this
 -- database (Postgres's default PUBLIC privilege) — and Postgres always
@@ -89,6 +103,29 @@ alter table residents enable row level security;
 -- or out goes through a SECURITY DEFINER function below (sign_up, sign_in,
 -- get_my_profile, complete_self_verification, council_set_verification) or
 -- the residents_public view (council roster only, no password_hash).
+
+-- ---------------------------------------------------------------------
+-- app_config — holds the JWT signing secret and the council signup code.
+-- A plain locked-down table instead of the Postgres GUCs
+-- (`ALTER DATABASE ... SET app.foo = ...`) earlier drafts of this
+-- migration used: confirmed on a real Supabase project that newer projects
+-- deny `ALTER DATABASE`/`ALTER ROLE` for custom parameters outright
+-- ("permission denied to set parameter"), even to the SQL Editor's own
+-- role. A table needs no special privilege beyond normal DML on something
+-- you own, and RLS with zero policies keeps it exactly as unreadable over
+-- the API as residents/poll_ballots are — see the one-time setup note at
+-- the top of this file for the `update app_config set ...` to run after
+-- this migration.
+-- ---------------------------------------------------------------------
+create table if not exists app_config (
+  id boolean primary key default true check (id),   -- singleton-row guard
+  jwt_secret text,
+  council_code text
+);
+insert into app_config (id) values (true) on conflict (id) do nothing;
+alter table app_config enable row level security;
+-- No policies: fully locked from anon/authenticated. Only
+-- mint_session_token()/sign_up() (both SECURITY DEFINER) ever read it.
 
 -- =====================================================================
 -- JWT / auth helper functions
@@ -229,12 +266,12 @@ $$;
 -- design intent — a resident is expected to sign back in periodically,
 -- not stay silently logged in indefinitely.
 create or replace function mint_session_token(p_resident_id text, p_role text) returns text
-language plpgsql security definer set search_path = pg_catalog, public as $$
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
-  v_secret text := current_setting('app.jwt_secret', true);
+  v_secret text := (select jwt_secret from app_config where id = true);
 begin
   if v_secret is null or v_secret = '' then
-    raise exception 'app.jwt_secret is not configured — see the setup note at the top of 0001_init.sql';
+    raise exception 'app_config.jwt_secret is not configured — see the setup note at the top of 0001_init.sql';
   end if;
   return sign(
     json_build_object(
@@ -260,9 +297,9 @@ create or replace function sign_up(
   p_full_name text, p_address text, p_city text, p_postal_code text,
   p_riding text, p_password text, p_council_code text
 ) returns jsonb
-language plpgsql security definer set search_path = pg_catalog, public as $$
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
-  v_is_council boolean := (p_council_code is not null and p_council_code = current_setting('app.council_code', true));
+  v_is_council boolean := (p_council_code is not null and p_council_code = (select council_code from app_config where id = true));
   v_id text;
   v_row residents;
 begin
@@ -309,7 +346,7 @@ grant execute on function sign_up(text,text,text,text,text,text,text) to anon, a
 create or replace function sign_in(
   p_full_name text, p_address text, p_riding text, p_password text
 ) returns jsonb
-language plpgsql security definer set search_path = pg_catalog, public as $$
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
   v_row residents;
 begin
@@ -339,7 +376,7 @@ grant execute on function sign_in(text,text,text,text) to anon, authenticated;
 -- (client falls back to the sign-in screen either way, matching current
 -- behavior when a stored session doesn't resolve to a real resident).
 create or replace function get_my_profile() returns jsonb
-language plpgsql security definer set search_path = pg_catalog, public as $$
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
   v_row residents;
 begin
@@ -364,7 +401,7 @@ grant execute on function get_my_profile() to authenticated;
 -- should eventually be replaced with a real identity-verification vendor.
 -- ---------------------------------------------------------------------
 create or replace function complete_self_verification() returns jsonb
-language plpgsql security definer set search_path = pg_catalog, public as $$
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
   v_row residents;
 begin
@@ -386,7 +423,7 @@ grant execute on function complete_self_verification() to authenticated;
 -- Council reviewing a pending application (or revoking one) — mirrors
 -- councilSetVerification() in the client.
 create or replace function council_set_verification(p_resident_id text, p_status text) returns jsonb
-language plpgsql security definer set search_path = pg_catalog, public as $$
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
   v_row residents;
 begin
@@ -416,7 +453,7 @@ grant execute on function council_set_verification(text,text) to authenticated;
 -- check-then-write pattern had (two tabs/devices racing the same vote).
 -- ---------------------------------------------------------------------
 create or replace function cast_vote(p_poll_id uuid, p_option_id text) returns void
-language plpgsql security definer set search_path = pg_catalog, public as $$
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
 declare
   v_poll polls;
   v_resident_id text := current_resident_id();
@@ -465,7 +502,7 @@ grant execute on function cast_vote(uuid,text) to authenticated;
 -- keeps its own note of WHICH option it chose (see SPEC.md — that stays
 -- client-local, same as before, because the server never learns it).
 create or replace function my_voted_polls() returns setof uuid
-language sql security definer stable set search_path = pg_catalog, public as $$
+language sql security definer stable set search_path = pg_catalog, public, extensions as $$
   select poll_id from poll_voters where resident_id = current_resident_id()
 $$;
 grant execute on function my_voted_polls() to authenticated;
@@ -474,7 +511,7 @@ grant execute on function my_voted_polls() to authenticated;
 -- though those rows carry no resident reference to begin with. Mirrors
 -- computeResults() in the client.
 create or replace function poll_results(p_poll_id uuid) returns jsonb
-language plpgsql security definer stable set search_path = pg_catalog, public as $$
+language plpgsql security definer stable set search_path = pg_catalog, public, extensions as $$
 declare
   v_poll polls;
   v_counts jsonb := '{}'::jsonb;
