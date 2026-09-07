@@ -1274,22 +1274,25 @@
     return (bestN > 0 && !tie) ? bestId : null;
   }
 
-  // All-time accountability stat: across every closed poll where both
-  // residents and council actually voted, what share of the time did
-  // council's winning choice match residents' winning choice? Needs
-  // res.counts/res.councilCounts loaded for every closed poll, which
-  // refreshCouncilTransparency()/refreshCouncilOwnResults() keep fed.
+  // All-time accountability stat: across every individual council vote
+  // (not per-poll), what share matched what residents voted for? Counted
+  // per VOTE rather than per poll's collective outcome on purpose — an
+  // earlier version compared council's own majority position on each poll
+  // against residents' pick, which could show "100% aligned" overall while
+  // the per-member breakdown below still listed an individual member who
+  // personally voted the other way (their dissent got outvoted by their
+  // own colleagues, so the poll-level comparison still called it a
+  // match). Deriving this from computeCouncilRecords() — the exact same
+  // per-vote data the breakdown below renders — instead of recomputing it
+  // separately means these two numbers can never disagree again.
   function computeCouncilAlignmentStats(){
     var total = 0, aligned = 0;
-    S.polls.forEach(function(p){
-      if(p.status !== 'closed') return;
-      var res = S.pollResults[p.id];
-      if(!res || !res.total || !res.councilVotes || !res.councilVotes.length) return;
-      var residentWinner = winningOptionId(res.counts);
-      var councilWinner = winningOptionId(res.councilCounts);
-      if(!residentWinner || !councilWinner) return;
-      total++;
-      if(residentWinner === councilWinner) aligned++;
+    computeCouncilRecords().forEach(function(m){
+      m.votes.forEach(function(v){
+        if(v.matchedResidents === null) return; // no clear resident pick to compare against
+        total++;
+        if(v.matchedResidents) aligned++;
+      });
     });
     return { total: total, aligned: aligned };
   }
@@ -1303,10 +1306,10 @@
       '<div style="font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; color:var(--ink-muted);">Council alignment, all time</div>' +
       '<div style="display:flex; align-items:baseline; gap:10px; margin:6px 0 10px; flex-wrap:wrap;">' +
         '<div class="mono" style="font-size:32px; font-weight:600;">' + pct + '%</div>' +
-        '<div style="font-size:13px; color:var(--ink-2);">of decided items, council\'s choice matched what residents voted for</div>' +
+        '<div style="font-size:13px; color:var(--ink-2);">of individual council votes matched what residents voted for</div>' +
       '</div>' +
       '<div class="turnout-track"><div class="turnout-fill" style="width:' + pct + '%; background:var(--good);"></div></div>' +
-      '<div style="font-size:12px; color:var(--ink-muted); margin-top:8px;">Based on ' + stats.aligned + ' of ' + stats.total + ' closed items where both residents and council have voted (a tie on either side isn\'t counted either way).</div>' +
+      '<div style="font-size:12px; color:var(--ink-muted); margin-top:8px;">Based on ' + stats.aligned + ' of ' + stats.total + ' council votes cast on closed items where residents also voted (counted per council member, not per item — a tie on residents\' side isn\'t counted either way).</div>' +
     '</div>';
   }
 
