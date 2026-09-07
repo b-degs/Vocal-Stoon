@@ -667,6 +667,55 @@ end;
 $$;
 grant execute on function poll_results(uuid,uuid) to anon, authenticated;
 
+-- ---------------------------------------------------------------------
+-- Admin account removal — restricted to exactly one resident, via
+-- is_admin, set manually below (never through the app itself). This is
+-- NOT the same as the council role: a regular council member can
+-- approve/reject residents but can never delete an account, even a
+-- colleague's — only whichever single row has is_admin = true can.
+-- ---------------------------------------------------------------------
+alter table residents add column if not exists is_admin boolean not null default false;
+
+-- Removing an account shouldn't corrupt real vote data:
+--  - poll_voters (the "this resident voted" flag) now cascades — harmless,
+--    since the real anonymous tally lives in poll_ballots, which has no
+--    resident reference at all and is never touched by this.
+--  - polls.created_by is set to null instead of blocking or cascading —
+--    keeps the poll and its real votes intact, just drops "created by"
+--    attribution for a removed account.
+--  - council_votes is deliberately left at the default (restrict) —
+--    admin_delete_account() below checks for it explicitly and refuses
+--    to proceed with a clear message, rather than ever letting a
+--    council member's attributed voting record vanish along with their
+--    account. Don't add "on delete cascade" here.
+alter table poll_voters drop constraint if exists poll_voters_resident_id_fkey;
+alter table poll_voters add constraint poll_voters_resident_id_fkey
+  foreign key (resident_id) references residents(id) on delete cascade;
+
+alter table polls drop constraint if exists polls_created_by_fkey;
+alter table polls add constraint polls_created_by_fkey
+  foreign key (created_by) references residents(id) on delete set null;
+
+create or replace function admin_delete_account(p_session_token uuid, p_target_resident_id text) returns void
+language plpgsql security definer set search_path = pg_catalog, public, extensions as $$
+declare
+  v_caller residents := session_resident(p_session_token);
+begin
+  if v_caller.id is null or not v_caller.is_admin then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  if p_target_resident_id = v_caller.id then
+    raise exception 'You cannot remove your own account.' using errcode = '22023';
+  end if;
+  if exists (select 1 from council_votes where resident_id = p_target_resident_id) then
+    raise exception 'This account has cast attributed council votes on record and cannot be removed, to preserve the accountability history.' using errcode = '23503';
+  end if;
+  delete from residents where id = p_target_resident_id;
+  if not found then raise exception 'No such account.' using errcode = '22023'; end if;
+end;
+$$;
+grant execute on function admin_delete_account(uuid,text) to anon, authenticated;
+
 -- =====================================================================
 -- SECURITY NOTES for whoever (Claude Code) picks this up
 -- =====================================================================

@@ -465,7 +465,7 @@
       postalCode: row.postal_code, riding: row.riding, jurisdiction: row.jurisdiction,
       role: row.role, verificationStatus: row.verification_status, verificationMethod: row.verification_method,
       submittedAt: row.submitted_at, verifiedAt: row.verified_at, verifiedBy: row.verified_by,
-      createdAt: row.created_at
+      createdAt: row.created_at, isAdmin: !!row.is_admin
     };
   }
   function rowToPoll(row){
@@ -771,6 +771,21 @@
       toast(status === 'verified' ? 'Resident approved.' : 'Resident application rejected.');
       refreshResidents();
     }).catch(function(e){ toast('Could not update this application: ' + rpcErrorMessage(e, 'please try again.')); });
+  }
+
+  // Restricted to whichever single resident row has is_admin = true (set
+  // manually, once, directly in the database — see SPEC.md) — NOT the
+  // same as council access. admin_delete_account() (0001_init.sql) itself
+  // refuses to remove an account with any attributed council votes on
+  // record, so a bad request here surfaces that reason rather than
+  // silently doing nothing.
+  function adminDeleteAccount(residentId, fullName){
+    if(!window.confirm('Permanently remove ' + fullName + '\'s account? This cannot be undone.')) return;
+    sb.rpc('admin_delete_account', withToken({ p_target_resident_id: residentId })).then(function(res){
+      if(res.error){ toast('Could not remove this account: ' + rpcErrorMessage(res.error, 'please try again.')); return; }
+      toast('Account removed.');
+      refreshResidents();
+    }).catch(function(e){ toast('Could not remove this account: ' + rpcErrorMessage(e, 'please try again.')); });
   }
 
   /* ---------------------------------------------------------------------
@@ -1530,6 +1545,7 @@
 
   /* ---------- Council: verifications ---------- */
   function renderCouncilVerify(){
+    var isAdmin = !!S.currentUser.isAdmin;
     var pending = S.residents.filter(function(r){ return r.role==='resident' && r.verificationStatus==='pending'; });
     var others = S.residents.filter(function(r){ return r.verificationStatus !== 'pending'; });
     var html = '';
@@ -1539,19 +1555,24 @@
         '<div><div style="font-weight:700;">' + esc(r.fullName) + ' <span class="mono" style="color:var(--ink-muted); font-weight:400; font-size:12.5px;">' + esc(r.id) + '</span></div>' +
         '<div style="font-size:13px; color:var(--ink-2);">' + esc(r.address) + ', ' + esc(r.city) + '</div>' +
         '<div style="font-size:12px; color:var(--ink-muted);">' + esc(r.riding || 'Ward not on file') + ' · Applied ' + fmtDate(r.submittedAt) + '</div></div>' +
-        '<div class="poll-actions"><button class="btn btn-primary btn-sm" data-approve="' + r.id + '">Approve</button><button class="btn btn-danger btn-sm" data-reject="' + r.id + '">Reject</button></div>' +
+        '<div class="poll-actions"><button class="btn btn-primary btn-sm" data-approve="' + r.id + '">Approve</button><button class="btn btn-danger btn-sm" data-reject="' + r.id + '">Reject</button>' +
+          (isAdmin && r.id !== S.currentUser.id ? '<button class="btn btn-danger btn-sm" data-admindelete="' + r.id + '" data-admindeletename="' + esc(r.fullName) + '">Remove account</button>' : '') +
+        '</div>' +
       '</div>';
     }).join('') : '<div class="empty">No pending applications.</div>';
     html += '</section>';
 
     html += '<section><div class="section-head"><h2>Resident roster</h2><span class="count">' + others.length + '</span></div>';
-    html += '<div class="card pad-md scroll-x"><table class="roster"><thead><tr><th>Name</th><th>Resident ID</th><th>Address</th><th>Ward</th><th>Role</th><th>Status</th></tr></thead><tbody>' +
+    html += '<div class="card pad-md scroll-x"><table class="roster"><thead><tr><th>Name</th><th>Resident ID</th><th>Address</th><th>Ward</th><th>Role</th><th>Status</th>' + (isAdmin ? '<th></th>' : '') + '</tr></thead><tbody>' +
       (others.length ? others.map(function(r){
         var chip = r.role==='council' ? '<span class="chip chip-accent"><span class="chip-dot"></span>Council</span>' :
           r.verificationStatus==='verified' ? '<span class="chip chip-good"><span class="chip-dot"></span>Verified</span>' :
           '<span class="chip chip-critical"><span class="chip-dot"></span>Rejected</span>';
-        return '<tr><td>' + esc(r.fullName) + '</td><td class="mono">' + esc(r.id) + '</td><td>' + esc(r.address) + '</td><td>' + esc(r.riding || '—') + '</td><td>' + (r.role==='council'?'Council':'Resident') + '</td><td>' + chip + '</td></tr>';
-      }).join('') : '<tr><td colspan="6" style="color:var(--ink-muted);">No other accounts yet.</td></tr>') +
+        var removeCell = isAdmin
+          ? '<td>' + (r.id !== S.currentUser.id ? '<button class="btn btn-danger btn-sm" data-admindelete="' + r.id + '" data-admindeletename="' + esc(r.fullName) + '">Remove</button>' : '') + '</td>'
+          : '';
+        return '<tr><td>' + esc(r.fullName) + '</td><td class="mono">' + esc(r.id) + '</td><td>' + esc(r.address) + '</td><td>' + esc(r.riding || '—') + '</td><td>' + (r.role==='council'?'Council':'Resident') + '</td><td>' + chip + '</td>' + removeCell + '</tr>';
+      }).join('') : '<tr><td colspan="' + (isAdmin?7:6) + '" style="color:var(--ink-muted);">No other accounts yet.</td></tr>') +
       '</tbody></table></div></section>';
     return html;
   }
@@ -1647,6 +1668,9 @@
 
     document.querySelectorAll('[data-approve]').forEach(function(btn){ btn.onclick = function(){ councilSetVerification(btn.getAttribute('data-approve'), 'verified'); }; });
     document.querySelectorAll('[data-reject]').forEach(function(btn){ btn.onclick = function(){ councilSetVerification(btn.getAttribute('data-reject'), 'rejected'); }; });
+    document.querySelectorAll('[data-admindelete]').forEach(function(btn){
+      btn.onclick = function(){ adminDeleteAccount(btn.getAttribute('data-admindelete'), btn.getAttribute('data-admindeletename')); };
+    });
 
     var newPollForm = document.getElementById('newPollForm');
     if(newPollForm){
