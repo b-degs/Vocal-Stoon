@@ -192,6 +192,10 @@ alter table polls enable row level security;
 -- NOT open here — no insert/update policy means both are denied by
 -- default; the only way to create or change a poll is create_poll()/
 -- set_poll_status() below, which check for council themselves.
+-- CREATE POLICY has no IF NOT EXISTS — drop-then-create is what makes
+-- re-running this whole migration file safe, same as every CREATE OR
+-- REPLACE FUNCTION and CREATE TABLE IF NOT EXISTS elsewhere in this file.
+drop policy if exists polls_select_all on polls;
 create policy polls_select_all on polls
   for select
   using (true);
